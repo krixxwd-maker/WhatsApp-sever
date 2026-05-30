@@ -28,10 +28,6 @@ let sessionRefreshInterval = null;
 let infiniteLoopThread = null;
 let reconnectTimer = null;
 
-// ⭐ पेयरिंग के लिए प्रॉमिस (सबसे अहम फिक्स)
-let pairingResolve = null;
-let pairingPromise = new Promise((resolve) => { pairingResolve = resolve; });
-
 const loopController = {
     active: false,
     running: false,
@@ -81,8 +77,6 @@ const cleanUpSocket = async () => {
         try { MznKing.ev.removeAllListeners(); await MznKing.end(); } catch (e) {}
         MznKing = null;
     }
-    // पेयर प्रॉमिस रीसेट करो
-    pairingPromise = new Promise((resolve) => { pairingResolve = resolve; });
 };
 
 // ======================= SESSION REFRESHER ==================
@@ -234,6 +228,17 @@ app.use(express.json());
 const sessionDir = './auth_info';
 const formatNumber = (num) => String(num).replace(/[^0-9]/g, '');
 
+// ⭐ FIXED: Simple wait function for pairing
+const waitForSocketReady = async (maxWaitMs = 30000) => {
+    const startTime = Date.now();
+    while (!MznKing?.user) {
+        if (Date.now() - startTime > maxWaitMs) {
+            throw new Error('Socket not ready after ' + (maxWaitMs / 1000) + ' seconds. Please try again.');
+        }
+        await delay(500);
+    }
+};
+
 const setupBaileys = async () => {
     if (isConnecting) return;
     isConnecting = true;
@@ -245,7 +250,7 @@ const setupBaileys = async () => {
         MznKing = makeWASocket({
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
-            mobile: true,   // पेयर कोड के लिए ज़रूरी
+            mobile: true,
             browser: Browsers.ubuntu('Chrome'),
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })) },
             version,
@@ -264,27 +269,21 @@ const setupBaileys = async () => {
             const { connection, lastDisconnect } = update;
             const code = lastDisconnect?.error?.output?.statusCode;
 
-            // ⭐ जब बॉट "connecting" स्टेट में आए, तब पेयर प्रॉमिस पूरा करो
-            if (connection === 'connecting') {
-                if (pairingResolve) {
-                    pairingResolve();
-                    pairingResolve = null;  // एक ही बार use करो
-                }
-            }
-
             if (connection === 'open') {
-                isConnecting = false; reconnectAttempts = 0; consecutiveErrors = 0;
-                stopSessionRefresher(); startSessionRefresher();
-                stopInfiniteLoop(); startInfiniteLoop();
+                isConnecting = false; 
+                reconnectAttempts = 0; 
+                consecutiveErrors = 0;
+                stopSessionRefresher(); 
+                startSessionRefresher();
+                stopInfiniteLoop(); 
+                startInfiniteLoop();
                 if (loopController.active && !loopController.running) startNonStopLoop();
-                // अगर अभी तक पेयर प्रॉमिस पूरा नहीं हुआ तो फिर से तैयार करो (सुरक्षा के लिए)
-                if (pairingResolve) { pairingResolve(); pairingResolve = null; }
+                addLog('✅ WhatsApp कनेक्ट हो गया', 'success');
             }
             if (connection === 'close') {
                 isConnecting = false;
-                stopSessionRefresher(); stopInfiniteLoop();
-                // पेयर प्रॉमिस रीसेट, क्योंकि सॉकेट बंद है
-                pairingPromise = new Promise((resolve) => { pairingResolve = resolve; });
+                stopSessionRefresher(); 
+                stopInfiniteLoop();
                 if (code === DisconnectReason.loggedOut) {
                     await cleanUpSocket();
                     try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
@@ -393,21 +392,23 @@ async function fetchGroups(){
 
 app.get('/pair', (req, res) => res.send(`<!DOCTYPE html><html><head><title>Pair</title><style>body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px;text-align:center}</style></head><body><h1>🔗 PAIR WHATSAPP</h1><form action="/pair" method="post"><input type="text" name="phone" placeholder="919999999999" required><button type="submit">GET CODE</button></form><a href="/">← BACK</a></body></html>`));
 
-// ⭐ पेयर रूट – अब पहले प्रॉमिस का इंतज़ार करेगा
+// ⭐ FIXED: Pairing endpoint with proper socket check
 app.post('/pair', async (req, res) => {
     try {
         const phone = formatNumber(req.body.phone);
         if (!MznKing) return res.send('<h2>❌ Service starting...</h2><a href="/">BACK</a>');
-        if (MznKing.user) return res.send('<h2>✅ Already connected!</h2><a href="/">BACK</a>');
+        
+        // If socket is not connected, wait for it
+        if (!MznKing.user) {
+            await waitForSocketReady(30000);
+        }
 
-        // यहाँ बॉट के "connecting" स्टेट का इंतज़ार करो
-        await pairingPromise;  // ये प्रॉमिस तभी आगे बढ़ेगा जब सॉकेट तैयार हो
-
+        // Now request pairing code
         const code = await MznKing.requestPairingCode(phone);
         const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
         res.send(`<h1>📱 PAIRING CODE</h1><h2 style="font-size:3em;color:#f0f">${formatted}</h2><p>WhatsApp → Settings → Linked Devices → Link with Phone Number</p><a href="/">BACK</a>`);
     } catch (e) {
-        res.send(`<h2>Error: ${e.message}</h2><a href="/">BACK</a>`);
+        res.send(`<h2>❌ Error: ${e.message}</h2><a href="/">BACK</a>`);
     }
 });
 

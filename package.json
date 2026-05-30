@@ -1,34 +1,21 @@
 {
-  "name": "harsh-king-whatsapp-server",
-  "version": "2.0.0",
-  "description": "Advanced WhatsApp Message Server with Auto-Reconnect",
-  "main": "whatsapp-server-fixed.js",
+  "name": "harsh-king-bot",
+  "version": "1.0.0",
+  "description": "HARSH KING - WhatsApp Infinite Message Sender",
+  "main": "app.js",
   "scripts": {
-    "start": "node whatsapp-server-fixed.js",
-    "dev": "nodemon whatsapp-server-fixed.js",
-    "clean": "rm -rf auth_info node_modules package-lock.json",
-    "reinstall": "npm run clean && npm install"
+    "start": "node app.js",
+    "dev": "node app.js"
   },
-  "keywords": [
-    "whatsapp",
-    "baileys",
-    "automation",
-    "messaging"
-  ],
-  "author": "Harsh King",
-  "license": "ISC",
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
-    "express": "^4.21.2",
+    "@whiskeysockets/baileys": "^6.6.0",
+    "express": "^4.18.2",
     "multer": "^1.4.5-lts.1",
-    "pino": "^9.5.0",
-    "qrcode-terminal": "^0.12.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.9"
+    "pino": "^8.17.2"
   },
   "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=8.0.0"
-  }
+    "node": ">=16.0.0"
+  },
+  "author": "HARSH KING",
+  "license": "ISC"
 }

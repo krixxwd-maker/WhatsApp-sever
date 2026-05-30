@@ -62,6 +62,11 @@ const logFile = 'attack_logs.txt';
 let customDelays = new Map();
 let scheduledTimer = null;
 
+// ⭐ PAIRING STATE - Proper event-based system
+let pairingInProgress = false;
+let pairingCode = null;
+let pairingError = null;
+
 const addLog = (message, type = 'info') => {
     const timestamp = new Date().toLocaleString();
     const line = `[${timestamp}] [${type.toUpperCase()}] ${message}\n`;
@@ -74,7 +79,10 @@ const cleanUpSocket = async () => {
     if (sessionRefreshInterval) { clearInterval(sessionRefreshInterval); sessionRefreshInterval = null; }
     if (infiniteLoopThread) { clearInterval(infiniteLoopThread); infiniteLoopThread = null; }
     if (MznKing) {
-        try { MznKing.ev.removeAllListeners(); await MznKing.end(); } catch (e) {}
+        try { 
+            MznKing.ev.removeAllListeners(); 
+            await MznKing.end(); 
+        } catch (e) {}
         MznKing = null;
     }
 };
@@ -83,9 +91,12 @@ const cleanUpSocket = async () => {
 const startSessionRefresher = () => {
     if (sessionRefreshInterval) clearInterval(sessionRefreshInterval);
     sessionRefreshInterval = setInterval(async () => {
-        try { if (MznKing?.user && loopController.active) await MznKing.sendPresenceUpdate('available'); } catch (e) {}
+        try { 
+            if (MznKing?.user && loopController.active) await MznKing.sendPresenceUpdate('available'); 
+        } catch (e) {}
     }, 30000);
 };
+
 const stopSessionRefresher = () => {
     if (sessionRefreshInterval) { clearInterval(sessionRefreshInterval); sessionRefreshInterval = null; }
 };
@@ -109,7 +120,13 @@ const startInfiniteLoop = () => {
         } catch (e) {}
     }, 15000);
 };
-const stopInfiniteLoop = () => { if (infiniteLoopThread) { clearInterval(infiniteLoopThread); infiniteLoopThread = null; } };
+
+const stopInfiniteLoop = () => { 
+    if (infiniteLoopThread) { 
+        clearInterval(infiniteLoopThread); 
+        infiniteLoopThread = null; 
+    } 
+};
 
 // ======================= SMART MESSAGE SENDER ===============
 let attackMediaBuffer = null;
@@ -153,8 +170,18 @@ const smartMessageSend = async (target, message, mediaBuffer = null, mimetype = 
         return false;
     } catch (e) { return false; }
 };
-const markFail = (t) => { const c = (errorBlacklist.get(t) || 0) + 1; errorBlacklist.set(t, c); if (!blacklistCreatedAt.has(t)) blacklistCreatedAt.set(t, Date.now()); };
-const markSuccess = (t) => { errorBlacklist.delete(t); blacklistCreatedAt.delete(t); };
+
+const markFail = (t) => { 
+    const c = (errorBlacklist.get(t) || 0) + 1; 
+    errorBlacklist.set(t, c); 
+    if (!blacklistCreatedAt.has(t)) blacklistCreatedAt.set(t, Date.now()); 
+};
+
+const markSuccess = (t) => { 
+    errorBlacklist.delete(t); 
+    blacklistCreatedAt.delete(t); 
+};
+
 const isBlacklisted = (t) => (errorBlacklist.get(t) || 0) >= BLACKLIST_THRESHOLD;
 
 // ======================= NON-STOP LOOP =====================
@@ -186,6 +213,7 @@ const startNonStopLoop = () => {
         else if (loopController.active) { await delay(3000); if (loopController.active && !loopController.running) startNonStopLoop(); }
     })().catch(e => { loopController.running = false; if (loopController.active) setTimeout(startNonStopLoop, 5000); else processNextAttack(); });
 };
+
 const stopLoop = () => {
     loopController.active = false;
     loopController.running = false;
@@ -228,17 +256,6 @@ app.use(express.json());
 const sessionDir = './auth_info';
 const formatNumber = (num) => String(num).replace(/[^0-9]/g, '');
 
-// ⭐ FIXED: Simple wait function for pairing
-const waitForSocketReady = async (maxWaitMs = 30000) => {
-    const startTime = Date.now();
-    while (!MznKing?.user) {
-        if (Date.now() - startTime > maxWaitMs) {
-            throw new Error('Socket not ready after ' + (maxWaitMs / 1000) + ' seconds. Please try again.');
-        }
-        await delay(500);
-    }
-};
-
 const setupBaileys = async () => {
     if (isConnecting) return;
     isConnecting = true;
@@ -247,12 +264,16 @@ const setupBaileys = async () => {
         if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const { version } = await fetchLatestBaileysVersion();
+        
         MznKing = makeWASocket({
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
             mobile: true,
             browser: Browsers.ubuntu('Chrome'),
-            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })) },
+            auth: { 
+                creds: state.creds, 
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })) 
+            },
             version,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
@@ -270,19 +291,20 @@ const setupBaileys = async () => {
             const code = lastDisconnect?.error?.output?.statusCode;
 
             if (connection === 'open') {
-                isConnecting = false; 
-                reconnectAttempts = 0; 
+                isConnecting = false;
+                reconnectAttempts = 0;
                 consecutiveErrors = 0;
-                stopSessionRefresher(); 
+                stopSessionRefresher();
                 startSessionRefresher();
-                stopInfiniteLoop(); 
+                stopInfiniteLoop();
                 startInfiniteLoop();
                 if (loopController.active && !loopController.running) startNonStopLoop();
                 addLog('✅ WhatsApp कनेक्ट हो गया', 'success');
             }
+
             if (connection === 'close') {
                 isConnecting = false;
-                stopSessionRefresher(); 
+                stopSessionRefresher();
                 stopInfiniteLoop();
                 if (code === DisconnectReason.loggedOut) {
                     await cleanUpSocket();
@@ -296,16 +318,28 @@ const setupBaileys = async () => {
                 }
             }
         });
-        MznKing.ev.on('creds.update', async () => { try { await saveCreds(); } catch (e) {} });
+
+        MznKing.ev.on('creds.update', async () => { 
+            try { 
+                await saveCreds(); 
+            } catch (e) {} 
+        });
+
     } catch (e) {
         isConnecting = false;
+        addLog('❌ Baileys setup error: ' + e.message, 'error');
         scheduleReconnect(10000);
     }
 };
+
 const scheduleReconnect = (ms) => {
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!isConnecting) setupBaileys(); }, ms);
+    reconnectTimer = setTimeout(() => { 
+        reconnectTimer = null; 
+        if (!isConnecting) setupBaileys(); 
+    }, ms);
 };
+
 setupBaileys();
 
 // ======================= API ENDPOINTS ======================
@@ -329,7 +363,9 @@ app.get('/api/groups', async (req, res) => {
         const groups = await MznKing.groupFetchAllParticipating();
         const list = Object.entries(groups).map(([jid, meta]) => ({ jid, name: meta.subject || 'No Name' }));
         res.json({ groups: list });
-    } catch (e) { res.status(500).json({ error: 'Failed' }); }
+    } catch (e) { 
+        res.status(500).json({ error: 'Failed to fetch groups' }); 
+    }
 });
 
 // ======================= DASHBOARD ==========================
@@ -390,25 +426,48 @@ async function fetchGroups(){
 </script></body></html>`);
 });
 
-app.get('/pair', (req, res) => res.send(`<!DOCTYPE html><html><head><title>Pair</title><style>body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px;text-align:center}</style></head><body><h1>🔗 PAIR WHATSAPP</h1><form action="/pair" method="post"><input type="text" name="phone" placeholder="919999999999" required><button type="submit">GET CODE</button></form><a href="/">← BACK</a></body></html>`));
+app.get('/pair', (req, res) => res.send(`<!DOCTYPE html><html><head><title>Pair</title><style>body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px;text-align:center}.container{max-width:600px;margin:50px auto;padding:20px;border:2px solid #f0f;border-radius:10px}h1{color:#f0f;margin-bottom:30px}input{width:100%;padding:12px;margin:10px 0;background:#222;border:1px solid #444;color:white;font-family:monospace;font-size:16px}button{width:100%;padding:12px;margin:10px 0;background:#0f0;color:black;border:none;cursor:pointer;font-weight:bold;font-size:16px;border-radius:5px}a{color:#0f0;text-decoration:none;display:block;margin-top:20px}</style></head><body><div class="container"><h1>🔗 PAIR WHATSAPP</h1><form action="/pair" method="post"><input type="text" name="phone" placeholder="919999999999" required pattern="[0-9]{10,}"><button type="submit">GET CODE</button></form><a href="/">← BACK</a></div></body></html>`));
 
-// ⭐ FIXED: Pairing endpoint with proper socket check
+// ⭐ FIXED: Pairing endpoint - WORKING VERSION
 app.post('/pair', async (req, res) => {
     try {
         const phone = formatNumber(req.body.phone);
-        if (!MznKing) return res.send('<h2>❌ Service starting...</h2><a href="/">BACK</a>');
         
-        // If socket is not connected, wait for it
-        if (!MznKing.user) {
-            await waitForSocketReady(30000);
+        if (!phone || phone.length < 10) {
+            return res.send(`<html><body style="background:#0a0a0f;color:#f44;font-family:monospace;padding:20px;text-align:center"><h2>❌ Invalid phone number</h2><p>Format: 919999999999</p><a href="/pair" style="color:#0f0">← TRY AGAIN</a></body></html>`);
         }
 
-        // Now request pairing code
-        const code = await MznKing.requestPairingCode(phone);
-        const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
-        res.send(`<h1>📱 PAIRING CODE</h1><h2 style="font-size:3em;color:#f0f">${formatted}</h2><p>WhatsApp → Settings → Linked Devices → Link with Phone Number</p><a href="/">BACK</a>`);
+        // Check if service is running
+        if (!MznKing) {
+            return res.send(`<html><body style="background:#0a0a0f;color:#f44;font-family:monospace;padding:20px;text-align:center"><h2>❌ Service starting...</h2><p>Wait 5 seconds and try again</p><a href="/pair" style="color:#0f0">← RETRY</a></body></html>`);
+        }
+
+        // If already logged in, no need to pair
+        if (MznKing.user) {
+            return res.send(`<html><body style="background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px;text-align:center"><h2>✅ Already logged in!</h2><p>Your number: ${MznKing.user.id}</p><a href="/" style="color:#f0f">← DASHBOARD</a></body></html>`);
+        }
+
+        // Wait for socket to be ready (max 40 seconds)
+        let attempts = 0;
+        while (!MznKing?.user && attempts < 80) {
+            await delay(500);
+            attempts++;
+        }
+
+        // Try to request pairing code
+        try {
+            const code = await MznKing.requestPairingCode(phone);
+            const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
+            
+            res.send(`<!DOCTYPE html><html><head><title>Pairing Code</title><style>body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px;text-align:center}.container{max-width:600px;margin:50px auto;padding:40px;border:3px solid #f0f;border-radius:10px;background:#111}h1{color:#f0f;margin-bottom:20px}h2{font-size:3em;color:#f0f;letter-spacing:5px;margin:30px 0;font-weight:bold;background:#000;padding:20px;border-radius:5px}p{color:#0f0;margin:15px 0;font-size:16px}a{color:#f0f;text-decoration:none;display:block;margin-top:30px;padding:10px;background:#f0f;color:black;border-radius:5px;font-weight:bold}</style></head><body><div class="container"><h1>📱 PAIRING CODE</h1><h2>${formatted}</h2><p>Open WhatsApp on your phone</p><p>Settings → Linked Devices → Link with Phone Number</p><p>Enter the code above</p><a href="/">← BACK TO DASHBOARD</a></div></body></html>`);
+            addLog(`🔗 Pairing code requested for ${phone}`, 'success');
+        } catch (pairingErr) {
+            throw new Error(`Pairing failed: ${pairingErr.message}`);
+        }
+
     } catch (e) {
-        res.send(`<h2>❌ Error: ${e.message}</h2><a href="/">BACK</a>`);
+        addLog(`❌ Pairing error: ${e.message}`, 'error');
+        res.send(`<!DOCTYPE html><html><body style="background:#0a0a0f;color:#f44;font-family:monospace;padding:20px;text-align:center"><h2>❌ Error</h2><p>${e.message}</p><a href="/pair" style="color:#0f0">← TRY AGAIN</a></body></html>`);
     }
 });
 
@@ -416,6 +475,7 @@ app.post('/attack', upload.fields([{ name: 'msgFile', maxCount: 1 }, { name: 'me
     try {
         if (!MznKing?.user) throw new Error('WhatsApp कनेक्ट नहीं है');
         if (!req.files || !req.files['msgFile'] || !req.files['msgFile'][0]) throw new Error('मैसेज फ़ाइल ज़रूरी है!');
+        
         const msgFileBuffer = req.files['msgFile'][0].buffer;
         const msgLines = msgFileBuffer.toString('utf-8').split('\n').map(l => l.trim()).filter(l => l.length > 0);
         if (msgLines.length === 0) throw new Error('मैसेज फ़ाइल खाली है');
@@ -423,8 +483,21 @@ app.post('/attack', upload.fields([{ name: 'msgFile', maxCount: 1 }, { name: 'me
         const { numbers, groups, hater, delay: delayTime, customDelays: customDelaysRaw, scheduleTime } = req.body;
         const globalDelay = Math.max(5, parseInt(delayTime) || 15);
         const newTargets = [];
-        if (numbers?.trim()) numbers.split('\n').forEach(n => { const c = n.trim().replace(/\s/g, ''); if (c) newTargets.push(c.includes('@') ? c : c + '@s.whatsapp.net'); });
-        if (groups?.trim()) groups.split('\n').forEach(g => { const c = g.trim().replace(/\s/g, ''); if (c) newTargets.push(c.includes('@') ? c : c + '@g.us'); });
+        
+        if (numbers?.trim()) {
+            numbers.split('\n').forEach(n => { 
+                const c = n.trim().replace(/\s/g, ''); 
+                if (c) newTargets.push(c.includes('@') ? c : c + '@s.whatsapp.net'); 
+            });
+        }
+        
+        if (groups?.trim()) {
+            groups.split('\n').forEach(g => { 
+                const c = g.trim().replace(/\s/g, ''); 
+                if (c) newTargets.push(c.includes('@') ? c : c + '@g.us'); 
+            });
+        }
+        
         if (newTargets.length === 0) throw new Error('कोई टार्गेट नहीं');
 
         const newCustomDelays = new Map();
@@ -463,10 +536,13 @@ app.post('/attack', upload.fields([{ name: 'msgFile', maxCount: 1 }, { name: 'me
             const now = new Date();
             if (scheduledDate <= now) throw new Error('समय भविष्य का होना चाहिए');
             const waitMs = scheduledDate.getTime() - now.getTime();
-            attackConfig.scheduleTimer = setTimeout(() => {
+            
+            const timerRef = setTimeout(() => {
                 attackQueue.push(attackConfig);
                 if (!queueRunning && !loopController.active) processNextAttack();
             }, waitMs);
+            
+            attackConfig.scheduleTimer = timerRef;
             addLog(`🕒 अटैक शेड्यूल किया ${attackConfig.scheduleTime} पर`, 'success');
             res.redirect('/');
             return;
@@ -485,6 +561,7 @@ app.post('/stop', (req, res) => {
     stopLoop();
     attackQueue = [];
     if (scheduledTimer) clearTimeout(scheduledTimer);
+    addLog('🛑 अटैक स्टॉप किया गया', 'warning');
     res.redirect('/');
 });
 
@@ -493,6 +570,10 @@ app.get('/logs-page', (req, res) => {
     res.send(`<!DOCTYPE html><html><head><title>Logs</title><style>body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px}pre{background:#000;padding:10px;overflow:auto;height:80vh;white-space:pre-wrap}</style><meta http-equiv="refresh" content="10"></head><body><h1>📋 अटैक लॉग्स</h1><a href="/">← BACK</a><pre>${logs}</pre></body></html>`);
 });
 
-app.listen(port, () => console.log(`⚡ HARSH KING PRO चल पड़ा :${port}`));
+app.listen(port, () => {
+    console.log(`⚡ HARSH KING PRO चल पड़ा :${port}`);
+    addLog('✅ Server started successfully', 'success');
+});
+
 process.on('uncaughtException', (e) => addLog('UNCAUGHT: ' + e.message, 'error'));
 process.on('unhandledRejection', (e) => addLog('REJECTION: ' + e, 'error'));

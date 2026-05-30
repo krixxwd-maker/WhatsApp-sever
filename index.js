@@ -28,9 +28,6 @@ let sessionRefreshInterval = null;
 let infiniteLoopThread = null;
 let reconnectTimer = null;
 
-// ⭐ नया: पेयरिंग रेडी फ्लैग
-let pairingReady = false;
-
 const loopController = {
     active: false,
     running: false,
@@ -224,7 +221,7 @@ const processNextAttack = () => {
     queueRunning = false;
 };
 
-// ======================= BAILEYS SETUP (FIXED) ==============
+// ======================= BAILEYS SETUP ======================
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -242,7 +239,7 @@ const setupBaileys = async () => {
         MznKing = makeWASocket({
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
-            mobile: true,   // ✅ ये लाइन जोड़ी – पेयर कोड के लिए ज़रूरी
+            mobile: true,   // ✅ पेयर कोड के लिए यही एक लाइन चाहिए
             browser: Browsers.ubuntu('Chrome'),
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })) },
             version,
@@ -256,18 +253,9 @@ const setupBaileys = async () => {
             patchMessageBeforeSending: (msg) => msg,
             getMessage: async () => ({ conversation: '' })
         });
-
         MznKing.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
             const code = lastDisconnect?.error?.output?.statusCode;
-
-            // ⭐ पेयरिंग रेडी को अपडेट करो
-            if (connection === 'connecting') {
-                pairingReady = true;
-            } else if (connection === 'open' || connection === 'close') {
-                pairingReady = false;
-            }
-
             if (connection === 'open') {
                 isConnecting = false; reconnectAttempts = 0; consecutiveErrors = 0;
                 stopSessionRefresher(); startSessionRefresher();
@@ -385,18 +373,12 @@ async function fetchGroups(){
 
 app.get('/pair', (req, res) => res.send(`<!DOCTYPE html><html><head><title>Pair</title><style>body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px;text-align:center}</style></head><body><h1>🔗 PAIR WHATSAPP</h1><form action="/pair" method="post"><input type="text" name="phone" placeholder="919999999999" required><button type="submit">GET CODE</button></form><a href="/">← BACK</a></body></html>`));
 
-// ⭐ फिक्स किया हुआ /pair रूट
+// ✅ ओरिजिनल पेयर रूट (बिना किसी फालतू चेक के)
 app.post('/pair', async (req, res) => {
     try {
         const phone = formatNumber(req.body.phone);
         if (!MznKing) return res.send('<h2>❌ Service starting...</h2><a href="/">BACK</a>');
         if (MznKing.user) return res.send('<h2>✅ Already connected!</h2><a href="/">BACK</a>');
-        
-        // पेयरिंग रेडी चेक करो
-        if (!pairingReady) {
-            return res.send('<h2>⏳ Bot अभी तैयार नहीं है, कृपया 5 सेकंड बाद दोबारा कोशिश करो।</h2><a href="/pair">रिफ्रेश</a>');
-        }
-
         const code = await MznKing.requestPairingCode(phone);
         const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
         res.send(`<h1>📱 PAIRING CODE</h1><h2 style="font-size:3em;color:#f0f">${formatted}</h2><p>WhatsApp → Settings → Linked Devices → Link with Phone Number</p><a href="/">BACK</a>`);

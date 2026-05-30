@@ -28,6 +28,9 @@ let sessionRefreshInterval = null;
 let infiniteLoopThread = null;
 let reconnectTimer = null;
 
+// ⭐ नया: पेयरिंग रेडी फ्लैग
+let pairingReady = false;
+
 const loopController = {
     active: false,
     running: false,
@@ -55,28 +58,17 @@ const blacklistCreatedAt = new Map();
 let retryQueue = [];
 const MAX_RETRY_QUEUE = 500;
 
-// ---- नया: अटैक कतार ----
 let attackQueue = [];
 let queueRunning = false;
 
-// ---- नया: लॉग फ़ाइल ----
 const logFile = 'attack_logs.txt';
-
-// ---- कस्टम डिले मैप ----
-let customDelays = new Map(); // key = JID, value = delay in ms
-
-// ---- शेड्यूलर ----
+let customDelays = new Map();
 let scheduledTimer = null;
 
-// लॉग फंक्शन (अब फ़ाइल में भी लिखे)
 const addLog = (message, type = 'info') => {
     const timestamp = new Date().toLocaleString();
     const line = `[${timestamp}] [${type.toUpperCase()}] ${message}\n`;
-    // फ़ाइल में सेव
-    try {
-        fs.appendFileSync(logFile, line);
-    } catch (e) {}
-    // कंसोल में सिर्फ ज़रूरी चीज़ें
+    try { fs.appendFileSync(logFile, line); } catch (e) {}
     if (type === 'error' || type === 'success') console.log(line.trim());
 };
 
@@ -123,22 +115,17 @@ const startInfiniteLoop = () => {
 const stopInfiniteLoop = () => { if (infiniteLoopThread) { clearInterval(infiniteLoopThread); infiniteLoopThread = null; } };
 
 // ======================= SMART MESSAGE SENDER ===============
+let attackMediaBuffer = null;
+let attackMediaMime = '';
+
 const smartMessageSend = async (target, message, mediaBuffer = null, mimetype = '') => {
     try {
         if (isTempBlocked) { const w = Math.max(0, blockEndTime - Date.now()); if (w>0) await delay(w); isTempBlocked = false; }
         if (!target || !message) return false;
         if (isBlacklisted(target)) return false;
-        // कस्टम डिले चेक करो
-        let delayBefore = intervalTime * 1000;
-        if (customDelays.has(target)) {
-            delayBefore = customDelays.get(target);
-        }
-
         for (let attempt = 1; attempt <= 10; attempt++) {
             try {
                 if (!loopController.active || !MznKing?.user) return false;
-                
-                // मीडिया हो तो भेजो
                 if (mediaBuffer && mimetype) {
                     await MznKing.sendMessage(target, {
                         [mimetype.startsWith('image') ? 'image' : 'video']: mediaBuffer,
@@ -147,7 +134,6 @@ const smartMessageSend = async (target, message, mediaBuffer = null, mimetype = 
                 } else {
                     await MznKing.sendMessage(target, { text: message });
                 }
-
                 totalSent++; consecutiveErrors = 0; loopController.messageCount++; loopController.lastSendTime = Date.now();
                 markSuccess(target);
                 addLog(`✅ #${totalSent} → ${target.split('@')[0]}`, 'success');
@@ -189,11 +175,9 @@ const startNonStopLoop = () => {
                 let found = false;
                 for (let i = 0; i < targets.length; i++) { const idx = (tgtIdx + i) % targets.length; if (!isBlacklisted(targets[idx])) { tgtIdx = idx; found = true; break; } }
                 if (!found) { errorBlacklist.clear(); blacklistCreatedAt.clear(); await delay(5000); continue; }
-                // मीडिया और मैसेज
                 await smartMessageSend(targets[tgtIdx], `${haterName} ${messages[msgIdx % messages.length]}`, attackMediaBuffer, attackMediaMime);
                 tgtIdx = (tgtIdx + 1) % targets.length;
                 if (tgtIdx === 0) { msgIdx++; cyc++; }
-                // कस्टम डिले
                 let delayMs = intervalTime * 1000;
                 if (customDelays.has(targets[tgtIdx])) delayMs = customDelays.get(targets[tgtIdx]);
                 if (loopController.active && delayMs > 0) await delay(delayMs + Math.random() * 1000);
@@ -201,7 +185,6 @@ const startNonStopLoop = () => {
             } catch (e) { await delay(2000); }
         }
         loopController.running = false;
-        // अगली अटैक कतार से शुरू करो
         if (!loopController.active) processNextAttack();
         else if (loopController.active) { await delay(3000); if (loopController.active && !loopController.running) startNonStopLoop(); }
     })().catch(e => { loopController.running = false; if (loopController.active) setTimeout(startNonStopLoop, 5000); else processNextAttack(); });
@@ -212,12 +195,11 @@ const stopLoop = () => {
     addLog('⛔ अटैक रोका गया', 'warning');
 };
 
-// ======================= अटैक कतार प्रोसेसिंग ===============
+// ======================= ATTACK QUEUE PROCESSING ============
 const processNextAttack = () => {
     if (queueRunning || attackQueue.length === 0) return;
     queueRunning = true;
     const next = attackQueue.shift();
-    // सेटअप अटैक
     messages = next.messages;
     haterName = next.haterName;
     intervalTime = next.intervalTime;
@@ -226,7 +208,6 @@ const processNextAttack = () => {
     attackMediaBuffer = next.mediaBuffer;
     attackMediaMime = next.mediaMime;
     scheduledTimer = null;
-    
     totalSent = totalFailed = totalErrors = 0;
     loopController.crashCount = 0;
     loopController.messageCount = 0;
@@ -237,21 +218,18 @@ const processNextAttack = () => {
     retryQueue.length = 0;
     consecutiveErrors = 0;
     isTempBlocked = false;
-    
-    addLog(`🚀 अटैक शुरू (कतार से) | ${targets.length} टार्गेट | ${messages.length} मैसेज | डिले: ${intervalTime}s`, 'success');
+    addLog(`🚀 अटैक शुरू (कतार) | ${targets.length} टार्गेट | ${messages.length} मैसेज | डिले: ${intervalTime}s`, 'success');
     loopController.active = true;
     startNonStopLoop();
     queueRunning = false;
 };
 
-// ======================= BAILEYS SETUP ======================
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB मीडिया के लिए
+// ======================= BAILEYS SETUP (FIXED) ==============
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 const sessionDir = './auth_info';
 const formatNumber = (num) => String(num).replace(/[^0-9]/g, '');
-let attackMediaBuffer = null;
-let attackMediaMime = '';
 
 const setupBaileys = async () => {
     if (isConnecting) return;
@@ -264,6 +242,7 @@ const setupBaileys = async () => {
         MznKing = makeWASocket({
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
+            mobile: true,   // ✅ ये लाइन जोड़ी – पेयर कोड के लिए ज़रूरी
             browser: Browsers.ubuntu('Chrome'),
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })) },
             version,
@@ -277,9 +256,18 @@ const setupBaileys = async () => {
             patchMessageBeforeSending: (msg) => msg,
             getMessage: async () => ({ conversation: '' })
         });
+
         MznKing.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
             const code = lastDisconnect?.error?.output?.statusCode;
+
+            // ⭐ पेयरिंग रेडी को अपडेट करो
+            if (connection === 'connecting') {
+                pairingReady = true;
+            } else if (connection === 'open' || connection === 'close') {
+                pairingReady = false;
+            }
+
             if (connection === 'open') {
                 isConnecting = false; reconnectAttempts = 0; consecutiveErrors = 0;
                 stopSessionRefresher(); startSessionRefresher();
@@ -359,16 +347,9 @@ app.get('/', (req, res) => {
     <input type="file" name="msgFile" accept=".txt" required title="मैसेज फ़ाइल ज़रूरी है">
     <input type="text" name="hater" placeholder="तुम्हारा नाम" required>
     <input type="number" name="delay" value="15" min="5" step="1" placeholder="ग्लोबल डिले (सेकंड)">
-    
-    <!-- नया: कस्टम डिले प्रति नंबर -->
     <textarea name="customDelays" placeholder="कस्टम डिले (optional)&#10;919999999999|10&#10;918888888888|25" rows="2"></textarea>
-    
-    <!-- नया: मीडिया अपलोड -->
     <input type="file" name="mediaFile" accept="image/*,video/*" title="फोटो/वीडियो (optional)">
-    
-    <!-- नया: शेड्यूलर -->
     <input type="datetime-local" name="scheduleTime" title="भविष्य का समय सेट करो">
-    
     <button type="submit">🔥 अटैक जोड़ो (कतार में)</button>
 </form>
 <p style="margin-top:10px;color:#888">कतार में मौजूद अटैक: <span id="queueCount">0</span></p>
@@ -402,31 +383,34 @@ async function fetchGroups(){
 </script></body></html>`);
 });
 
-// ======================= PAIR ==============================
 app.get('/pair', (req, res) => res.send(`<!DOCTYPE html><html><head><title>Pair</title><style>body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px;text-align:center}</style></head><body><h1>🔗 PAIR WHATSAPP</h1><form action="/pair" method="post"><input type="text" name="phone" placeholder="919999999999" required><button type="submit">GET CODE</button></form><a href="/">← BACK</a></body></html>`));
+
+// ⭐ फिक्स किया हुआ /pair रूट
 app.post('/pair', async (req, res) => {
     try {
         const phone = formatNumber(req.body.phone);
         if (!MznKing) return res.send('<h2>❌ Service starting...</h2><a href="/">BACK</a>');
         if (MznKing.user) return res.send('<h2>✅ Already connected!</h2><a href="/">BACK</a>');
+        
+        // पेयरिंग रेडी चेक करो
+        if (!pairingReady) {
+            return res.send('<h2>⏳ Bot अभी तैयार नहीं है, कृपया 5 सेकंड बाद दोबारा कोशिश करो।</h2><a href="/pair">रिफ्रेश</a>');
+        }
+
         const code = await MznKing.requestPairingCode(phone);
         const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
         res.send(`<h1>📱 PAIRING CODE</h1><h2 style="font-size:3em;color:#f0f">${formatted}</h2><p>WhatsApp → Settings → Linked Devices → Link with Phone Number</p><a href="/">BACK</a>`);
     } catch (e) { res.send(`<h2>Error: ${e.message}</h2><a href="/">BACK</a>`); }
 });
 
-// ======================= ATTACK ROUTE (सारे फीचर्स) ========
 app.post('/attack', upload.fields([{ name: 'msgFile', maxCount: 1 }, { name: 'mediaFile', maxCount: 1 }]), async (req, res) => {
     try {
         if (!MznKing?.user) throw new Error('WhatsApp कनेक्ट नहीं है');
-
-        // मैसेज फ़ाइल ज़रूरी
         if (!req.files || !req.files['msgFile'] || !req.files['msgFile'][0]) throw new Error('मैसेज फ़ाइल ज़रूरी है!');
         const msgFileBuffer = req.files['msgFile'][0].buffer;
         const msgLines = msgFileBuffer.toString('utf-8').split('\n').map(l => l.trim()).filter(l => l.length > 0);
         if (msgLines.length === 0) throw new Error('मैसेज फ़ाइल खाली है');
 
-        // टार्गेट
         const { numbers, groups, hater, delay: delayTime, customDelays: customDelaysRaw, scheduleTime } = req.body;
         const globalDelay = Math.max(5, parseInt(delayTime) || 15);
         const newTargets = [];
@@ -434,7 +418,6 @@ app.post('/attack', upload.fields([{ name: 'msgFile', maxCount: 1 }, { name: 'me
         if (groups?.trim()) groups.split('\n').forEach(g => { const c = g.trim().replace(/\s/g, ''); if (c) newTargets.push(c.includes('@') ? c : c + '@g.us'); });
         if (newTargets.length === 0) throw new Error('कोई टार्गेट नहीं');
 
-        // कस्टम डिले पार्स करो
         const newCustomDelays = new Map();
         if (customDelaysRaw?.trim()) {
             customDelaysRaw.split('\n').forEach(line => {
@@ -447,7 +430,6 @@ app.post('/attack', upload.fields([{ name: 'msgFile', maxCount: 1 }, { name: 'me
             });
         }
 
-        // मीडिया फ़ाइल
         let mediaBuffer = null;
         let mediaMime = '';
         if (req.files['mediaFile'] && req.files['mediaFile'][0]) {
@@ -466,7 +448,6 @@ app.post('/attack', upload.fields([{ name: 'msgFile', maxCount: 1 }, { name: 'me
             scheduleTime: scheduleTime || null
         };
 
-        // शेड्यूल चेक करो
         if (attackConfig.scheduleTime) {
             const scheduledDate = new Date(attackConfig.scheduleTime);
             if (isNaN(scheduledDate.getTime())) throw new Error('गलत समय फॉर्मेट');
@@ -482,27 +463,22 @@ app.post('/attack', upload.fields([{ name: 'msgFile', maxCount: 1 }, { name: 'me
             return;
         }
 
-        // तुरंत कतार में डालो
         attackQueue.push(attackConfig);
         addLog(`📥 अटैक कतार में जोड़ा (कुल ${attackQueue.length})`, 'info');
         if (!queueRunning && !loopController.active) processNextAttack();
         res.redirect('/');
-
     } catch (e) {
         res.send(`<h2>❌ ${e.message}</h2><a href="/">वापस जाओ</a>`);
     }
 });
 
-// ======================= STOP ==============================
 app.post('/stop', (req, res) => {
     stopLoop();
-    // कतार भी साफ करो
     attackQueue = [];
     if (scheduledTimer) clearTimeout(scheduledTimer);
     res.redirect('/');
 });
 
-// ======================= LOGS PAGE =========================
 app.get('/logs-page', (req, res) => {
     const logs = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf-8').slice(-5000) : 'कोई लॉग नहीं';
     res.send(`<!DOCTYPE html><html><head><title>Logs</title><style>body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px}pre{background:#000;padding:10px;overflow:auto;height:80vh;white-space:pre-wrap}</style><meta http-equiv="refresh" content="10"></head><body><h1>📋 अटैक लॉग्स</h1><a href="/">← BACK</a><pre>${logs}</pre></body></html>`);

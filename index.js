@@ -1,5 +1,5 @@
 // ============================================================================
-// MUSKAN WITH YANIKI WHATSAPP ULTRA v8.5 – ENTERPRISE EDITION (TARGETS FIXED) - BUG FIXES APPLIED
+// MUSKAN WITH YANkI WHATSAPP ULTRA v8.5 – ENTERPRISE EDITION (TARGETS FIXED) - BUG FIXES APPLIED
 // ============================================================================
 import express from 'express';
 import fs from 'fs';

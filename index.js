@@ -26,6 +26,10 @@ let totalFailed = 0;
 let currentMsgIndex = 0;
 let currentTargetIndex = 0;
 
+// Pairing readiness flag
+let pairingReady = false;
+let qrReceived = false;
+
 const logger = pino({ level: 'silent' });
 
 // ==================== WHATSAPP CONNECTION ====================
@@ -38,7 +42,7 @@ async function connectToWhatsApp() {
 
     sock = makeWASocket({
       logger,
-      printQRInTerminal: true, // Terminal me QR bhi aayega
+      printQRInTerminal: true, // Terminal me QR bhi dikhega
       browser: Browsers.ubuntu('Chrome'),
       auth: {
         creds: state.creds,
@@ -48,19 +52,29 @@ async function connectToWhatsApp() {
     });
 
     sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect } = update;
+      const { connection, lastDisconnect, qr } = update;
+
+      // QR code aaya to pairingReady true
+      if (qr) {
+        console.log('📱 QR code received! Pairing ready.');
+        pairingReady = true;
+        qrReceived = true;
+      }
+
       if (connection === 'open') {
         isConnected = true;
         console.log('✅ WhatsApp connected!');
       }
+
       if (connection === 'close') {
         isConnected = false;
+        pairingReady = false;
+        qrReceived = false;
         const statusCode = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output ? lastDisconnect.error.output.statusCode : null;
         console.log('❌ Disconnected, status:', statusCode);
         if (statusCode === DisconnectReason.loggedOut) {
           fs.rmSync('./auth_info', { recursive: true, force: true });
         }
-        // Reconnect after 5s
         setTimeout(() => connectToWhatsApp(), 5000);
       }
     });
@@ -74,24 +88,53 @@ async function connectToWhatsApp() {
 }
 
 // ==================== PAIRING CODE ====================
+app.get('/pair-page', (req, res) => {
+  res.send(`
+    <html>
+    <head><title>Pair WhatsApp</title></head>
+    <body style="background:#111;color:#0f0;font-family:monospace;text-align:center;padding:40px;">
+      <h1 style="color:#f0f;">📱 Pair WhatsApp</h1>
+      <form action="/pair" method="post">
+        <input type="text" name="phone" placeholder="919999999999" required style="padding:15px;font-size:1.2em;background:#222;border:2px solid #f0f;color:#fff;border-radius:5px;width:300px;margin:20px;">
+        <br>
+        <button type="submit" style="padding:15px 30px;background:#f0f;color:#fff;border:none;border-radius:5px;font-size:1.2em;cursor:pointer;">GET CODE</button>
+      </form>
+      <p style="color:#aaa;">Country code ke sath number daalo (e.g. 91XXXXXXXXXX)</p>
+      <a href="/" style="color:#0f0;">🏠 Dashboard</a>
+    </body>
+    </html>
+  `);
+});
+
 app.post('/pair', async (req, res) => {
   const phone = (req.body.phone || '').replace(/[^0-9]/g, '');
   if (!phone || phone.length < 10 || phone.length > 15) {
     return res.send('<h2>❌ Invalid phone number</h2><a href="/pair-page">BACK</a>');
   }
 
-  // Wait for socket to be ready
+  // Socket check
   if (!sock) {
     return res.send('<h2>❌ WhatsApp socket not ready. Try again in a few seconds.</h2><a href="/pair-page">BACK</a>');
   }
 
-  // If already connected, no need pairing
+  // Already connected?
   if (isConnected && sock.user) {
     return res.send('<h2>✅ Already paired!</h2><a href="/">GO TO DASHBOARD</a>');
   }
 
+  // Wait for pairingReady (QR generated) max 20 seconds
+  let waited = 0;
+  while (!pairingReady && waited < 20000) {
+    await delay(500);
+    waited += 500;
+  }
+
+  if (!pairingReady) {
+    return res.send('<h2>❌ Pairing not ready. Please wait a few seconds and try again.</h2><a href="/pair-page">BACK</a>');
+  }
+
   try {
-    // Request pairing code
+    // Now request pairing code
     const code = await sock.requestPairingCode(phone);
     const formatted = code.match(/.{1,4}/g) ? code.match(/.{1,4}/g).join('-') : code;
     res.send(`
@@ -112,24 +155,6 @@ app.post('/pair', async (req, res) => {
     console.error('Pairing error:', err.message);
     res.send('<h2>❌ Pairing failed: ' + err.message + '</h2><a href="/pair-page">BACK</a>');
   }
-});
-
-app.get('/pair-page', (req, res) => {
-  res.send(`
-    <html>
-    <head><title>Pair WhatsApp</title></head>
-    <body style="background:#111;color:#0f0;font-family:monospace;text-align:center;padding:40px;">
-      <h1 style="color:#f0f;">📱 Pair WhatsApp</h1>
-      <form action="/pair" method="post">
-        <input type="text" name="phone" placeholder="919999999999" required style="padding:15px;font-size:1.2em;background:#222;border:2px solid #f0f;color:#fff;border-radius:5px;width:300px;margin:20px;">
-        <br>
-        <button type="submit" style="padding:15px 30px;background:#f0f;color:#fff;border:none;border-radius:5px;font-size:1.2em;cursor:pointer;">GET CODE</button>
-      </form>
-      <p style="color:#aaa;">Country code ke sath number daalo (e.g. 91XXXXXXXXXX)</p>
-      <a href="/" style="color:#0f0;">🏠 Dashboard</a>
-    </body>
-    </html>
-  `);
 });
 
 // ==================== ATTACK LOOP ====================
@@ -232,16 +257,13 @@ app.get('/', (req, res) => {
 // ==================== ATTACK ENDPOINT ====================
 app.post('/attack', upload.single('msgFile'), (req, res) => {
   try {
-    // Stop previous loop
     stopLoop();
 
-    // Reset stats
     totalSent = 0;
     totalFailed = 0;
     currentMsgIndex = 0;
     currentTargetIndex = 0;
 
-    // Parse numbers
     targets = [];
     if (req.body.numbers) {
       const lines = req.body.numbers.split('\n').map(l => l.trim()).filter(l => l.length > 0);
@@ -252,7 +274,6 @@ app.post('/attack', upload.single('msgFile'), (req, res) => {
         }
       }
     }
-    // Parse groups
     if (req.body.groups) {
       const lines = req.body.groups.split('\n').map(l => l.trim()).filter(l => l.length > 0);
       for (const line of lines) {
@@ -266,7 +287,6 @@ app.post('/attack', upload.single('msgFile'), (req, res) => {
       return res.send('<h2>❌ No valid targets provided</h2><a href="/">BACK</a>');
     }
 
-    // Parse message file
     if (!req.file) {
       return res.send('<h2>❌ Message file required</h2><a href="/">BACK</a>');
     }
@@ -279,7 +299,6 @@ app.post('/attack', upload.single('msgFile'), (req, res) => {
     delaySeconds = parseInt(req.body.delay) || 10;
     if (delaySeconds < 1) delaySeconds = 1;
 
-    // Start loop
     startLoop();
 
     res.redirect('/');

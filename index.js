@@ -10,13 +10,13 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Global variables
+// ==================== GLOBAL STATE ====================
 let sock = null;
 let saveCreds = null;
 let isConnected = false;
-let loopRunning = false;
-let loopInterval = null;
+let pairingReady = false;
 
+let loopRunning = false;
 let targets = [];
 let messages = [];
 let haterName = 'krix';
@@ -25,10 +25,6 @@ let totalSent = 0;
 let totalFailed = 0;
 let currentMsgIndex = 0;
 let currentTargetIndex = 0;
-
-// Pairing readiness flag
-let pairingReady = false;
-let qrReceived = false;
 
 const logger = pino({ level: 'silent' });
 
@@ -42,7 +38,7 @@ async function connectToWhatsApp() {
 
     sock = makeWASocket({
       logger,
-      printQRInTerminal: true, // Terminal me QR bhi dikhega
+      printQRInTerminal: true, // Terminal me QR bhi dikhega (fallback)
       browser: Browsers.ubuntu('Chrome'),
       auth: {
         creds: state.creds,
@@ -54,22 +50,21 @@ async function connectToWhatsApp() {
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      // QR code aaya to pairingReady true
       if (qr) {
-        console.log('📱 QR code received! Pairing ready.');
+        // QR generated => pairing possible
         pairingReady = true;
-        qrReceived = true;
+        console.log('✅ Pairing ready! QR generated internally. Now you can use pairing code.');
       }
 
       if (connection === 'open') {
         isConnected = true;
         console.log('✅ WhatsApp connected!');
+        pairingReady = false; // reset
       }
 
       if (connection === 'close') {
         isConnected = false;
         pairingReady = false;
-        qrReceived = false;
         const statusCode = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output ? lastDisconnect.error.output.statusCode : null;
         console.log('❌ Disconnected, status:', statusCode);
         if (statusCode === DisconnectReason.loggedOut) {
@@ -87,42 +82,58 @@ async function connectToWhatsApp() {
   }
 }
 
-// ==================== PAIRING CODE ====================
-app.get('/pair-page', (req, res) => {
+// ==================== PAIRING PAGE ====================
+app.get('/pair', (req, res) => {
   res.send(`
     <html>
-    <head><title>Pair WhatsApp</title></head>
-    <body style="background:#111;color:#0f0;font-family:monospace;text-align:center;padding:40px;">
-      <h1 style="color:#f0f;">📱 Pair WhatsApp</h1>
-      <form action="/pair" method="post">
-        <input type="text" name="phone" placeholder="919999999999" required style="padding:15px;font-size:1.2em;background:#222;border:2px solid #f0f;color:#fff;border-radius:5px;width:300px;margin:20px;">
+    <head>
+      <title>Pair WhatsApp - Muskan with Yanki</title>
+      <style>
+        body { background:#111; color:#0f0; font-family:monospace; text-align:center; padding:40px; }
+        h1 { color:#f0f; }
+        input { padding:15px; font-size:1.2em; background:#222; border:2px solid #f0f; color:#fff; border-radius:5px; width:300px; margin:20px; }
+        button { padding:15px 30px; background:#f0f; color:#fff; border:none; border-radius:5px; font-size:1.2em; cursor:pointer; }
+        .steps { background:#222; padding:15px; border-radius:5px; margin:20px auto; max-width:500px; text-align:left; color:#aaa; }
+        a { color:#0f0; }
+      </style>
+    </head>
+    <body>
+      <h1>📱 Pair WhatsApp</h1>
+      <p style="color:#aaa;">Enter your phone number with country code (no + or spaces)</p>
+      <form action="/get-code" method="post">
+        <input type="text" name="phone" placeholder="919999999999" required>
         <br>
-        <button type="submit" style="padding:15px 30px;background:#f0f;color:#fff;border:none;border-radius:5px;font-size:1.2em;cursor:pointer;">GET CODE</button>
+        <button type="submit">GET PAIRING CODE</button>
       </form>
-      <p style="color:#aaa;">Country code ke sath number daalo (e.g. 91XXXXXXXXXX)</p>
-      <a href="/" style="color:#0f0;">🏠 Dashboard</a>
+      <div class="steps">
+        <strong>📌 Code milne ke baad ye karo (phone pe):</strong><br>
+        1. WhatsApp kholo<br>
+        2. Settings → Linked Devices<br>
+        3. "Link a Device" tap karo<br>
+        4. "Link with phone number instead?" choose karo<br>
+        5. Code enter karo (2 minute ke andar)
+      </div>
+      <p><a href="/">🏠 Dashboard</a></p>
     </body>
     </html>
   `);
 });
 
-app.post('/pair', async (req, res) => {
+app.post('/get-code', async (req, res) => {
   const phone = (req.body.phone || '').replace(/[^0-9]/g, '');
   if (!phone || phone.length < 10 || phone.length > 15) {
-    return res.send('<h2>❌ Invalid phone number</h2><a href="/pair-page">BACK</a>');
+    return res.send('<h2>❌ Invalid phone number</h2><a href="/pair">BACK</a>');
   }
 
-  // Socket check
   if (!sock) {
-    return res.send('<h2>❌ WhatsApp socket not ready. Try again in a few seconds.</h2><a href="/pair-page">BACK</a>');
+    return res.send('<h2>❌ WhatsApp not ready yet. Wait a few seconds and try again.</h2><a href="/pair">BACK</a>');
   }
 
-  // Already connected?
   if (isConnected && sock.user) {
     return res.send('<h2>✅ Already paired!</h2><a href="/">GO TO DASHBOARD</a>');
   }
 
-  // Wait for pairingReady (QR generated) max 20 seconds
+  // Wait up to 20 seconds for QR to be ready
   let waited = 0;
   while (!pairingReady && waited < 20000) {
     await delay(500);
@@ -130,30 +141,33 @@ app.post('/pair', async (req, res) => {
   }
 
   if (!pairingReady) {
-    return res.send('<h2>❌ Pairing not ready. Please wait a few seconds and try again.</h2><a href="/pair-page">BACK</a>');
+    return res.send('<h2>❌ Pairing not ready. Please restart server and try again.</h2><a href="/pair">BACK</a>');
   }
 
   try {
-    // Now request pairing code
     const code = await sock.requestPairingCode(phone);
     const formatted = code.match(/.{1,4}/g) ? code.match(/.{1,4}/g).join('-') : code;
     res.send(`
       <html>
-      <head><title>Pairing Code</title></head>
-      <body style="background:#111;color:#0f0;font-family:monospace;text-align:center;padding:40px;">
-        <h1 style="color:#f0f;">📱 Pairing Code</h1>
-        <div style="font-size:3em;color:#f0f;letter-spacing:5px;background:#000;padding:20px;border-radius:10px;display:inline-block;">
-          ${formatted}
-        </div>
-        <p style="color:#aaa;">Is code ko WhatsApp → Linked Devices → Link a Device me enter karo.</p>
-        <a href="/" style="color:#0f0;">🏠 Dashboard</a> | 
-        <a href="/pair-page" style="color:#0f0;">🔄 New Code</a>
+      <head>
+        <title>Pairing Code</title>
+        <style>
+          body { background:#111; color:#0f0; font-family:monospace; text-align:center; padding:40px; }
+          .code-box { font-size:3em; color:#f0f; letter-spacing:5px; background:#000; padding:20px; border-radius:10px; display:inline-block; margin:20px; }
+          a { color:#0f0; }
+        </style>
+      </head>
+      <body>
+        <h1>📱 Pairing Code</h1>
+        <div class="code-box">${formatted}</div>
+        <p style="color:#aaa;">Enter this code in WhatsApp → Linked Devices → Link a Device</p>
+        <p><a href="/">🏠 Dashboard</a> | <a href="/pair">🔄 New Code</a></p>
       </body>
       </html>
     `);
   } catch (err) {
     console.error('Pairing error:', err.message);
-    res.send('<h2>❌ Pairing failed: ' + err.message + '</h2><a href="/pair-page">BACK</a>');
+    res.send('<h2>❌ Pairing failed: ' + err.message + '</h2><a href="/pair">BACK</a>');
   }
 });
 
@@ -211,6 +225,7 @@ app.get('/', (req, res) => {
         textarea, input { width:100%; padding:10px; margin:10px 0; background:#222; border:1px solid #444; color:#fff; font-family:monospace; border-radius:5px; }
         button { background:#f0f; color:#fff; padding:12px 30px; border:none; border-radius:5px; cursor:pointer; font-size:1.1em; }
         .status { text-align:center; font-size:1.5em; margin:20px 0; }
+        a { color:#0f0; }
       </style>
     </head>
     <body>
@@ -221,7 +236,7 @@ app.get('/', (req, res) => {
       </div>
       <div class="box">
         <h3>📱 Pair WhatsApp</h3>
-        <a href="/pair-page" style="color:#0f0;">Go to Pairing Page</a>
+        <a href="/pair">Go to Pairing Page</a>
       </div>
       <div class="box">
         <h3>⚡ Start Attack</h3>
@@ -318,6 +333,6 @@ const PORT = 5000;
 connectToWhatsApp();
 app.listen(PORT, () => {
   console.log(`\n🚀 Muskan with Yanki running on http://localhost:${PORT}`);
-  console.log('📱 Pairing page: http://localhost:' + PORT + '/pair-page');
-  console.log('💡 QR code bhi terminal me dikhega (agar chahe to scan kar lo)\n');
+  console.log('📱 Pairing page: http://localhost:' + PORT + '/pair');
+  console.log('💡 Pairing code page pe jaakar phone number daalo. QR bhi terminal me dikhega (fallback).\n');
 });

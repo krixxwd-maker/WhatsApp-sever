@@ -594,19 +594,98 @@ refresh();
 </html>`);
 });
 
+// FRESH PAIR PAGE
 app.get('/pair', (req, res) => {
-    res.send(`<!DOCTYPE html><html><head><title>Pair WhatsApp</title><style>body{background:#0a0a0f;color:#00ff88;font-family:monospace;padding:20px;text-align:center}</style></head><body><h1>🔗 PAIR WHATSAPP</h1><form action="/pair" method="post"><input type="text" name="phone" placeholder="919999999999" required><button type="submit">GET CODE</button></form><a href="/">← BACK</a></body></html>`);
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+    <title>Pair WhatsApp</title>
+    <style>
+        body{background:#0a0a0f;color:#00ff88;font-family:monospace;padding:20px;text-align:center}
+        h1{color:#ff00ff}
+        input{padding:12px;width:300px;margin:10px;background:#222;border:1px solid #00ff88;color:#fff;font-size:18px}
+        button{padding:12px 30px;background:#00ff88;color:#000;border:none;cursor:pointer;font-weight:bold;font-size:16px;margin:5px}
+        .code{font-size:3em;color:#ff00ff;letter-spacing:5px;margin:20px}
+        .logout{background:#ff4444;color:#fff;text-decoration:none;padding:10px 20px;display:inline-block;margin-top:20px}
+        a{color:#00ff88;text-decoration:none}
+        .note{color:#888;font-size:14px;margin:20px}
+    </style>
+</head>
+<body>
+    <h1>🔗 PAIR WHATSAPP (FRESH CODE)</h1>
+    ${MznKing?.user ? '<p style="color:#ff4444">⚠️ Already Connected! Pehle LOGOUT karo.</p>' : ''}
+    <form action="/pair" method="post">
+        <input type="text" name="phone" placeholder="919999999999" required><br>
+        <button type="submit">📱 GET FRESH CODE</button>
+    </form>
+    <div id="result">
+        ${req.query.code ? `<h2>Your Pair Code:</h2><div class="code">${req.query.code}</div><p class="note">⚠️ Code 20 second me expire ho jayega. Jaldi use karo!</p>` : ''}
+    </div>
+    ${MznKing?.user ? '<a class="logout" href="/logout">🚫 LOGOUT & RESET SESSION</a><br><br>' : ''}
+    <br><br>
+    <a href="/">← BACK</a>
+    <script>
+        // Agar code na mila toh 60 sec me page reload
+        const url = new URL(window.location.href);
+        if (!url.searchParams.get('code')) {
+            setTimeout(() => location.reload(), 60000);
+        }
+    </script>
+</body>
+</html>`);
 });
 
 app.post('/pair', async (req, res) => {
     try {
         const phone = formatNumber(req.body.phone);
-        if (!MznKing) return res.send('<h2>❌ Service starting...</h2><a href="/">BACK</a>');
-        if (MznKing.user) return res.send('<h2>✅ Already connected!</h2><a href="/">BACK</a>');
+        if (!MznKing) return res.send('<h2>❌ Service starting... Wait</h2><a href="/">BACK</a>');
+        
+        if (MznKing.user) {
+            return res.send('<h2>⚠️ Already Connected!</h2><p>Pehle <a href="/logout">LOGOUT</a> karo</p><a href="/">BACK</a>');
+        }
+        
+        // Fresh code generate karo
         const code = await MznKing.requestPairingCode(phone);
         const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
-        res.send(`<h1>📱 PAIRING CODE</h1><h2 style="font-size:3em;color:#ff00ff">${formatted}</h2><p>Open WhatsApp → Settings → Linked Devices → Link with Phone Number</p><a href="/">BACK</a>`);
-    } catch(e) { res.send(`<h2>Error: ${e.message}</h2><a href="/">BACK</a>`); }
+        
+        addLog(`📱 Fresh pair code generated for ${phone}: ${formatted}`, 'success');
+        
+        // Code ke saath redirect karo (refresh ke liye same code dikhega)
+        res.redirect(`/pair?code=${encodeURIComponent(formatted)}`);
+    } catch(e) { 
+        res.send(`<h2>Error: ${e.message}</h2><a href="/">BACK</a>`); 
+    }
+});
+
+// LOGOUT - SESSION RESET
+app.get('/logout', (req, res) => {
+    try {
+        addLog('🚫 Logout requested - Clearing session', 'warning');
+        
+        if (MznKing) {
+            try { MznKing.end(); } catch(e) {}
+            MznKing = null;
+        }
+        
+        stopLoop();
+        
+        // Session folder delete karo
+        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
+        
+        // 3 second baad naya session start hoga
+        setTimeout(() => {
+            setupBaileys();
+        }, 3000);
+        
+        res.send(`<html><body style="background:#0a0a0f;color:#00ff88;font-family:monospace;text-align:center;padding:50px">
+            <h1>✅ Session Cleared!</h1>
+            <p>3 second me naya session start hoga...</p>
+            <a href="/pair">🔗 Get Fresh Pair Code</a>
+            <br><br><a href="/">← BACK</a>
+        </body></html>`);
+    } catch(e) {
+        res.send(`<h2>Error: ${e.message}</h2><a href="/">BACK</a>`);
+    }
 });
 
 app.get('/attack-page', (req, res) => {
@@ -700,5 +779,7 @@ app.listen(port, () => {
 ║  ✅ AUTO THROTTLING & COOLDOWN                          ║
 ║  ✅ WILL NEVER STOP ONCE STARTED                        ║
 ║  ✅ AUTO-RECOVERY FROM ANY ERROR                        ║
+║  ✅ FRESH PAIR CODE EVERY TIME                          ║
+║  ✅ LOGOUT & RESET SESSION                              ║
 ╚══════════════════════════════════════════════════════════╝`);
 });

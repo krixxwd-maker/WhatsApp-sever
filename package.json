@@ -1,7 +1,7 @@
 {
   "name": "muskan-with-yanki",
   "version": "1.0.0",
-  "description": "Muskan with Yanki - WhatsApp message sender",
+  "description": "Muskan with Yanki - Full Featured WhatsApp Sender",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

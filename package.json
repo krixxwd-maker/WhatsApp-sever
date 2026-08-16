@@ -1,13 +1,16 @@
 {
   "name": "muskan-with-yanki",
   "version": "1.0.0",
-  "description": "Muskan with Yanki - Full Featured WhatsApp Sender",
-  "main": "index.js",
+  "description": "WhatsApp pairing-code login, message send, and bulk send server using Baileys",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.8",
+    "@whiskeysockets/baileys": "^6.7.9",
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",
     "pino": "^9.3.2"

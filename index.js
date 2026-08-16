@@ -111,7 +111,19 @@ async function connectToWhatsApp() {
     if (!fs.existsSync('./auth_info')) fs.mkdirSync('./auth_info', { recursive: true });
     const { state, saveCreds: save } = await useMultiFileAuthState('./auth_info');
     saveCreds = save;
-    const { version } = await fetchLatestBaileysVersion();
+
+    // fetchLatestBaileysVersion() hits the network. If that call is slow or
+    // fails (common right after a cold start on free hosting), don't let it
+    // block socket creation forever — fall back to a known-good version.
+    let version;
+    try {
+      const versionTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('version fetch timeout')), 8000));
+      const result = await Promise.race([fetchLatestBaileysVersion(), versionTimeout]);
+      version = result.version;
+    } catch (verErr) {
+      console.error('⚠️ Could not fetch latest Baileys version, using fallback:', verErr.message);
+      version = [2, 3000, 1023223821]; // reasonably recent fallback, updated periodically
+    }
 
     sock = makeWASocket({
       logger,
@@ -124,6 +136,7 @@ async function connectToWhatsApp() {
       version,
     });
 
+    console.log('🔌 Socket created, waiting for connection...');
     sockGeneration += 1;
     // Any pairing codes we handed out belonged to the previous socket
     // session and are no longer valid — drop them so we don't re-serve them.
@@ -413,6 +426,19 @@ app.get('/groups', async (req, res) => {
   }
 });
 
+// ---------- DEBUG STATUS ----------
+app.get('/status', (req, res) => {
+  res.json({
+    socketExists: !!sock,
+    isConnected,
+    hasUser: !!sock?.user,
+    wsReadyState: sock?.ws?.readyState ?? null,
+    sockGeneration,
+    bulkJobRunning: bulkJob.running,
+    uptimeSeconds: Math.floor(process.uptime()),
+  });
+});
+
 // ---------- PAIRING PAGE ----------
 app.get('/pair', (req, res) => {
   res.send(`
@@ -458,7 +484,13 @@ app.post('/get-code', async (req, res) => {
     return res.send('<h2>❌ Invalid phone number</h2><a href="/pair">BACK</a>');
   }
 
-  // Ensure socket exists
+  // Ensure socket exists — poll briefly instead of failing instantly,
+  // since right after a cold start the socket can take a few seconds to spin up.
+  let waited = 0;
+  while (!sock && waited < 15000) {
+    await delay(500);
+    waited += 500;
+  }
   if (!sock) {
     return res.send('<h2>❌ WhatsApp not ready yet. Please wait a few seconds and try again.</h2><a href="/pair">BACK</a>');
   }

@@ -1,693 +1,704 @@
 const express = require('express');
-const fs = require('fs');
-const multer = require('multer');
-const pino = require('pino');
-const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, DisconnectReason, delay } = require('@whiskeysockets/baileys');
+const fs      = require('fs');
+const pino    = require('pino');
+const multer  = require('multer');
+const {
+    makeWASocket,
+    useMultiFileAuthState,
+    delay,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore,
+    Browsers
+} = require('@whiskeysockets/baileys');
 
-const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
+const app  = express();
+const port = process.env.PORT || 20023;
+
+// ════════════════════════════════════════════════════════════
+//  GLOBAL STATE
+// ════════════════════════════════════════════════════════════
+let MznKing                 = null;
+let messages                = null;
+let targets                 = [];
+let intervalTime            = null;
+let haterName               = null;
+let reconnectAttempts       = 0;
+let isConnecting            = false;
+let keepAliveInterval       = null;
+let connectionCheckInterval = null;
+let reconnectTimer          = null;
+let infiniteLoopThread      = null;
+let sessionRefreshInterval  = null;
+
+const loopController = { 
+    active: false, 
+    running: false, 
+    crashCount: 0, 
+    lastActivityTime: Date.now(),
+    lastSendTime: Date.now(),
+    forcedClearCount: 0,
+    messageCount: 0
+};
+
+let totalSent      = 0;
+let totalFailed    = 0;
+let totalRecovered = 0;
+let totalErrors    = 0;
+let sessionStart   = null;
+
+// Rate limiting detection
+let consecutiveErrors = 0;
+let isTempBlocked = false;
+let blockEndTime = 0;
+
+const errorBlacklist      = new Map();
+const BLACKLIST_THRESHOLD = 3;
+const BLACKLIST_RESET_MS  = 30000;
+const blacklistTimeouts   = new Map();
+const blacklistCreatedAt  = new Map();
+
+let retryQueue      = [];
+const MAX_RETRY_QUEUE = 500;
+
+let liveLogs    = [];
+const MAX_LOGS  = 200;
+
+const addLog = (message, type = 'info') => {
+    try {
+        const timestamp = new Date().toLocaleTimeString();
+        liveLogs.unshift({ timestamp, message, type });
+        if (liveLogs.length > MAX_LOGS) {
+            liveLogs.length = MAX_LOGS;
+        }
+        console.log(`[${timestamp}] [${type.toUpperCase()}] ${message}`);
+    } catch (e) {}
+};
+
+// ════════════════════════════════════════════════════════════
+//  SESSION REFRESHER - Prevents session corruption
+// ════════════════════════════════════════════════════════════
+const startSessionRefresher = () => {
+    if (sessionRefreshInterval) clearInterval(sessionRefreshInterval);
+    sessionRefreshInterval = setInterval(async () => {
+        try {
+            if (MznKing?.user && loopController.active) {
+                await MznKing.sendPresenceUpdate('available').catch(() => {});
+                if (loopController.messageCount % 30 === 0 && loopController.messageCount > 0) {
+                    await delay(1000).catch(() => {});
+                }
+            }
+        } catch (e) {
+            // ignore – session refresh fails silently
+        }
+    }, 30000);
+};
+
+// ════════════════════════════════════════════════════════════
+//  INFINITE LOOP ENGINE - ULTRA AGGRESSIVE
+// ════════════════════════════════════════════════════════════
+const startInfiniteLoop = () => {
+    if (infiniteLoopThread) clearInterval(infiniteLoopThread);
+    
+    addLog('🚀 ULTRA INFINITE ENGINE STARTED', 'success');
+    
+    infiniteLoopThread = setInterval(async () => {
+        try {
+            // Check for temporary block
+            if (isTempBlocked) {
+                if (Date.now() > blockEndTime) {
+                    isTempBlocked = false;
+                    addLog('[UNBLOCK] Temporary block lifted - resuming', 'success');
+                }
+                return;
+            }
+            
+            // Force restart if loop should run but isn't
+            if (loopController.active && !loopController.running) {
+                addLog('[FORCE] Loop dead - restarting NOW', 'warning');
+                loopController.running = false;
+                startNonStopLoop();
+            }
+            
+            // Check send stall
+            const timeSinceLastSend = Date.now() - loopController.lastSendTime;
+            if (loopController.active && timeSinceLastSend > 60000) {
+                addLog(`[STALL] ${Math.floor(timeSinceLastSend/1000)}s stall - emergency reset`, 'error');
+                
+                // Emergency clear everything
+                errorBlacklist.clear();
+                blacklistCreatedAt.clear();
+                blacklistTimeouts.forEach(t => clearTimeout(t));
+                blacklistTimeouts.clear();
+                
+                // Reset connection if needed
+                if (!MznKing?.user) {
+                    scheduleReconnect(1000);
+                }
+                
+                loopController.running = false;
+                loopController.lastSendTime = Date.now();
+                startNonStopLoop();
+            }
+            
+            // Auto clear blacklisted targets
+            const now = Date.now();
+            for (const [target, count] of errorBlacklist) {
+                const createdAt = blacklistCreatedAt.get(target) || now;
+                if (now - createdAt > BLACKLIST_RESET_MS) {
+                    errorBlacklist.delete(target);
+                    blacklistCreatedAt.delete(target);
+                    addLog(`[AUTO-CLEAR] ${target.split('@')[0]}`, 'info');
+                }
+            }
+            
+            // If all targets blacklisted, force clear all
+            if (targets.length > 0 && errorBlacklist.size >= targets.length) {
+                addLog(`[EMERGENCY] All ${targets.length} targets blacklisted - MASS CLEAR`, 'warning');
+                errorBlacklist.clear();
+                blacklistCreatedAt.clear();
+                loopController.forcedClearCount++;
+            }
+            
+        } catch (e) {
+            addLog(`Engine error: ${e.message}`, 'error');
+        }
+    }, 10000);
+};
+
+// ════════════════════════════════════════════════════════════
+//  WAITING MESSAGES - Keeps connection alive
+// ════════════════════════════════════════════════════════════
+const keepConnectionAlive = async () => {
+    try {
+        if (MznKing?.user) {
+            await MznKing.sendPresenceUpdate('available').catch(() => {});
+            await MznKing.readMessages([]).catch(() => {});
+        }
+    } catch (e) {}
+};
+
+// ════════════════════════════════════════════════════════════
+//  SMART MESSAGE SENDER - With automatic throttling
+// ════════════════════════════════════════════════════════════
+const smartMessageSend = async (target, message, retryCount = 0) => {
+    try {
+        if (isTempBlocked) {
+            const waitTime = Math.max(0, blockEndTime - Date.now());
+            if (waitTime > 0) {
+                addLog(`[BLOCKED] Waiting ${Math.ceil(waitTime/1000)}s...`, 'warning');
+                await delay(waitTime).catch(() => {});
+                isTempBlocked = false;
+            }
+        }
+        
+        if (!target || !message) return false;
+        if (isBlacklisted(target)) return false;
+        
+        // Progressive delay based on error count
+        let baseDelay = intervalTime * 1000;
+        if (consecutiveErrors > 3) {
+            baseDelay += Math.min(30000, consecutiveErrors * 2000);
+        }
+        
+        const MAX_RETRIES = 10;
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                if (!loopController.active) return false;
+                if (!MznKing?.user) {
+                    await delay(2000).catch(() => {});
+                    continue;
+                }
+                
+                await MznKing.sendMessage(target, { text: message }).catch(e => { throw e; });
+                
+                const display = target.includes('@g.us') ? `Group:${target.split('@')[0].slice(-8)}` : target.split('@')[0];
+                totalSent++;
+                consecutiveErrors = 0;
+                loopController.messageCount++;
+                loopController.lastActivityTime = Date.now();
+                loopController.lastSendTime = Date.now();
+                markSuccess(target);
+                
+                if (totalSent % 10 === 0) {
+                    addLog(`📨 #${totalSent} → ${display}`, 'success');
+                }
+                
+                await delay(Math.random() * 500).catch(() => {});
+                return true;
+                
+            } catch (err) {
+                totalErrors++;
+                const errMsg = err?.message || String(err);
+                
+                // Detect rate limiting / temporary block
+                if (errMsg.includes('429') || errMsg.includes('rate') || errMsg.includes('too many')) {
+                    consecutiveErrors++;
+                    if (consecutiveErrors >= 3) {
+                        isTempBlocked = true;
+                        blockEndTime = Date.now() + 60000; // 1 minute block
+                        addLog(`⚠️ TEMPORARY BLOCK - 60s cooldown`, 'error');
+                        await delay(60000).catch(() => {});
+                        isTempBlocked = false;
+                        consecutiveErrors = 0;
+                        continue;
+                    }
+                }
+                
+                addLog(`❌ Attempt ${attempt}/${MAX_RETRIES}`, 'error');
+                markFail(target);
+                
+                if (attempt < MAX_RETRIES) {
+                    const backoff = Math.min(10000, 2000 * attempt);
+                    await delay(backoff).catch(() => {});
+                }
+            }
+        }
+        
+        totalFailed++;
+        if (retryQueue.length < MAX_RETRY_QUEUE) {
+            retryQueue.push({ target, message, addedAt: Date.now() });
+        }
+        return false;
+        
+    } catch (e) {
+        addLog(`Send error: ${e.message}`, 'error');
+        return false;
+    }
+};
+
+const markFail = (target) => {
+    const count = (errorBlacklist.get(target) || 0) + 1;
+    errorBlacklist.set(target, count);
+    if (!blacklistCreatedAt.has(target)) blacklistCreatedAt.set(target, Date.now());
+};
+
+const markSuccess = (t) => { 
+    if (errorBlacklist.has(t)) {
+        errorBlacklist.delete(t);
+        blacklistCreatedAt.delete(t);
+    }
+};
+
+const isBlacklisted = (t) => (errorBlacklist.get(t) || 0) >= BLACKLIST_THRESHOLD;
+
+// ════════════════════════════════════════════════════════════
+//  NON-STOP LOOP - SEAMLESS CONTINUOUS
+// ════════════════════════════════════════════════════════════
+const startNonStopLoop = () => {
+    if (loopController.running) {
+        addLog('[LOOP] Already running', 'info');
+        return;
+    }
+
+    loopController.running = true;
+    loopController.crashCount = 0;
+    loopController.lastActivityTime = Date.now();
+    sessionStart = sessionStart || Date.now();
+
+    let msgIndex = 0;
+    let targetIndex = 0;
+    let cycleCount = 0;
+
+    addLog('🔥 INFINITE LOOP ENGAGED 🔥', 'success');
+
+    (async () => {
+        while (loopController.active) {
+            try {
+                // Wait for connection
+                while (!MznKing?.user && loopController.active) {
+                    addLog('[WAIT] Connection...', 'info');
+                    await delay(3000).catch(() => {});
+                }
+                
+                if (!loopController.active) break;
+                if (!messages?.length || !targets?.length) {
+                    await delay(1000).catch(() => {});
+                    continue;
+                }
+                
+                // Find next non-blacklisted target (with wrap-around)
+                let found = false;
+                for (let i = 0; i < targets.length; i++) {
+                    const idx = (targetIndex + i) % targets.length;
+                    if (!isBlacklisted(targets[idx])) {
+                        targetIndex = idx;
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if (!found) {
+                    addLog('[CLEAR] Removing all blacklists...', 'warning');
+                    errorBlacklist.clear();
+                    blacklistCreatedAt.clear();
+                    await delay(5000).catch(() => {});
+                    continue;
+                }
+                
+                const fullMessage = `${haterName} ${messages[msgIndex % messages.length]}`;
+                const target = targets[targetIndex];
+                
+                await smartMessageSend(target, fullMessage);
+                
+                targetIndex = (targetIndex + 1) % targets.length;
+                if (targetIndex === 0) {
+                    msgIndex++;
+                    cycleCount++;
+                    if (cycleCount % 5 === 0) {
+                        addLog(`📊 Cycle ${cycleCount} | Sent:${totalSent} | BL:${errorBlacklist.size}`, 'info');
+                    }
+                }
+                
+                if (loopController.active && intervalTime > 0) {
+                    const jitter = Math.random() * 1000;
+                    await delay((intervalTime * 1000) + jitter).catch(() => {});
+                }
+                
+                // Keep connection alive every cycle
+                if (cycleCount % 10 === 0 && cycleCount > 0) {
+                    await keepConnectionAlive().catch(() => {});
+                }
+                
+            } catch (err) {
+                loopController.crashCount++;
+                addLog(`⚠️ Loop error #${loopController.crashCount}: ${err.message}`, 'error');
+                await delay(2000).catch(() => {});
+            }
+        }
+        
+        loopController.running = false;
+        addLog('[LOOP] Stopped', 'warning');
+        
+        if (loopController.active) {
+            addLog('[RESTART] Auto restarting in 3s...', 'warning');
+            await delay(3000).catch(() => {});
+            if (loopController.active && !loopController.running) {
+                startNonStopLoop();
+            }
+        }
+    })().catch(e => {
+        addLog(`Loop fatal: ${e.message}`, 'error');
+        loopController.running = false;
+        if (loopController.active) setTimeout(startNonStopLoop, 5000);
+    });
+};
+
+const stopLoop = () => {
+    loopController.active = false;
+    loopController.running = false;
+    addLog('⛔ Loop stopped by user', 'warning');
+};
+
+// ════════════════════════════════════════════════════════════
+//  BAILEYS SETUP WITH AUTO-RECOVERY
+// ════════════════════════════════════════════════════════════
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ---------- STATE ----------
-let sock = null;
-let saveCreds = null;
-let isConnected = false;
+const sessionDir = './auth_info';
+const formatNumber = (num) => String(num).replace(/[^0-9]/g, '');
 
-// Bumped every time we create a brand new socket. Pairing codes are only
-// valid for the socket session that generated them, so we tag cache
-// entries with the generation that made them and reject anything stale.
-let sockGeneration = 0;
+const setupBaileys = async () => {
+    if (isConnecting) return;
+    isConnecting = true;
+    addLog('📱 Connecting to WhatsApp...', 'info');
 
-// pairing code cache to avoid duplicate generation
-// phone -> { code, timestamp, generation }
-const pairingCache = new Map();
+    try {
+        if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+        
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        const { version } = await fetchLatestBaileysVersion();
 
-// How long we're willing to hand back the *same* code instead of asking
-// Baileys for a new one. Kept short — WhatsApp pairing codes are short-lived,
-// so caching for minutes just serves users an expired code.
-const PAIRING_CACHE_MS = 45000;
+        if (MznKing) {
+            try { MznKing.end(); } catch(e) {}
+            MznKing = null;
+        }
 
-// ---------- BULK SEND JOB STATE ----------
-// Only one bulk job runs at a time to avoid overlapping sends / rate storms.
-const bulkJob = {
-  running: false,
-  stopRequested: false,
-  total: 0,
-  sent: 0,
-  failed: 0,
-  currentNumber: null,
-  log: [],       // last N entries: { number, status, error? }
-  startedAt: null,
-  finishedAt: null,
+        MznKing = makeWASocket({
+            logger: pino({ level: 'silent' }),
+            printQRInTerminal: false,
+            browser: Browsers.ubuntu('Chrome'),
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }))
+            },
+            version,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000,
+            emitOwnEvents: false,
+            retryRequestDelayMs: 1000,
+            maxMsReconnectWait: 5000,
+            generateHighQualityLinkPreview: false,
+            patchMessageBeforeSending: (msg) => msg,
+            getMessage: async () => ({ conversation: '' })
+        });
+
+        MznKing.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
+            
+            if (connection === 'open') {
+                isConnecting = false;
+                reconnectAttempts = 0;
+                consecutiveErrors = 0;
+                addLog(`✅ CONNECTED!`, 'success');
+                startSessionRefresher();
+                startInfiniteLoop();
+                
+                if (loopController.active && !loopController.running) {
+                    addLog('[RESUME] Starting loop...', 'success');
+                    startNonStopLoop();
+                }
+            }
+            
+            if (connection === 'close') {
+                isConnecting = false;
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                addLog(`🔌 Disconnected (${statusCode})`, 'warning');
+                
+                if (statusCode === DisconnectReason.loggedOut) {
+                    addLog('🚫 Logged out - clearing session', 'error');
+                    try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
+                    scheduleReconnect(5000);
+                } else {
+                    reconnectAttempts++;
+                    const waitMs = Math.min(30000, 3000 * reconnectAttempts);
+                    scheduleReconnect(waitMs);
+                }
+            }
+        });
+
+        MznKing.ev.on('creds.update', async () => {
+            try { await saveCreds(); } catch(e) {}
+        });
+
+    } catch (error) {
+        isConnecting = false;
+        addLog(`❌ Setup error: ${error.message}`, 'error');
+        scheduleReconnect(10000);
+    }
 };
 
-function bulkLog(entry) {
-  bulkJob.log.push(entry);
-  if (bulkJob.log.length > 200) bulkJob.log.shift(); // cap memory
-}
+const scheduleReconnect = (waitMs) => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    addLog(`🔄 Reconnecting in ${Math.round(waitMs/1000)}s`, 'info');
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!isConnecting) setupBaileys();
+    }, waitMs);
+};
 
-const logger = pino({ level: 'silent' });
+setupBaileys();
 
-// ---------- KEEP THE SERVER ALIVE ----------
-// Baileys/Node can throw from deep inside event callbacks or socket
-// internals. Without these handlers, one bad event kills the whole process.
-// Log and keep running instead of crashing.
-process.on('uncaughtException', (err) => {
-  console.error('🧯 Uncaught exception (server kept alive):', err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('🧯 Unhandled rejection (server kept alive):', reason);
-});
-
-// ---------- HELPER: Normalize phone number ----------
-function normalizePhone(input) {
-  // remove all non-digits
-  let digits = input.replace(/\D/g, '');
-  // optional: add country code if missing? we assume user gives with country code
-  if (digits.length < 10 || digits.length > 15) return null;
-  return digits;
-}
-
-// ---------- HELPER: Parse a numbers list from uploaded text ----------
-// Accepts one number per line, or comma/space separated. Skips blanks and
-// invalid entries instead of failing the whole batch.
-function parseNumbersFromText(text) {
-  const raw = text.split(/[\n,;\s]+/).map(s => s.trim()).filter(Boolean);
-  const seen = new Set();
-  const numbers = [];
-  for (const r of raw) {
-    const n = normalizePhone(r);
-    if (n && !seen.has(n)) {
-      seen.add(n);
-      numbers.push(n);
-    }
-  }
-  return numbers;
-}
-// Calling requestPairingCode too early (right after makeWASocket, before the
-// underlying WS handshake finishes) throws "Connection Closed". Poll briefly
-// instead of assuming it's ready.
-async function waitForSocketReady(targetSock, timeoutMs = 8000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (targetSock?.ws?.readyState === 1) return true;
-    // socket got replaced or torn down while we were waiting
-    if (targetSock !== sock) return false;
-    await delay(200);
-  }
-  return targetSock?.ws?.readyState === 1;
-}
-
-// ---------- WHATSAPP CONNECTION ----------
-async function connectToWhatsApp() {
-  // Prevent duplicate socket creation/reconnect loops
-  if (sock && (isConnected || sock.ws?.readyState === 1)) {
-    console.log('⚠️ Socket already exists, skipping duplicate connect');
-    return;
-  }
-
-  try {
-    if (!fs.existsSync('./auth_info')) fs.mkdirSync('./auth_info', { recursive: true });
-    const { state, saveCreds: save } = await useMultiFileAuthState('./auth_info');
-    saveCreds = save;
-
-    // fetchLatestBaileysVersion() hits the network. If that call is slow or
-    // fails (common right after a cold start on free hosting), don't let it
-    // block socket creation forever — fall back to a known-good version.
-    let version;
-    try {
-      const versionTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('version fetch timeout')), 8000));
-      const result = await Promise.race([fetchLatestBaileysVersion(), versionTimeout]);
-      version = result.version;
-    } catch (verErr) {
-      console.error('⚠️ Could not fetch latest Baileys version, using fallback:', verErr.message);
-      version = [2, 3000, 1023223821]; // reasonably recent fallback, updated periodically
-    }
-
-    sock = makeWASocket({
-      logger,
-      printQRInTerminal: false,          // QR disabled
-      browser: Browsers.ubuntu('Chrome'),
-      auth: {
-        creds: state.creds,
-        keys: state.keys,
-      },
-      version,
+// ════════════════════════════════════════════════════════════
+//  API ENDPOINTS
+// ════════════════════════════════════════════════════════════
+app.get('/api/status', (req, res) => {
+    const uptimeSec = sessionStart ? Math.floor((Date.now() - sessionStart) / 1000) : 0;
+    res.json({
+        connected: !!MznKing?.user,
+        active: loopController.active,
+        running: loopController.running,
+        targets: targets.length,
+        messages: messages?.length || 0,
+        totalSent, totalFailed, totalErrors,
+        blacklistCount: errorBlacklist.size,
+        retryQueueSize: retryQueue.length,
+        uptime: `${Math.floor(uptimeSec/3600)}h ${Math.floor((uptimeSec%3600)/60)}m ${uptimeSec%60}s`,
+        blocked: isTempBlocked,
+        forcedClears: loopController.forcedClearCount
     });
-
-    console.log('🔌 Socket created, waiting for connection...');
-    sockGeneration += 1;
-    // Any pairing codes we handed out belonged to the previous socket
-    // session and are no longer valid — drop them so we don't re-serve them.
-    pairingCache.clear();
-
-    sock.ev.on('connection.update', (update) => {
-     try {
-      const { connection, lastDisconnect } = update;
-
-      if (connection === 'open') {
-        isConnected = true;
-        console.log('✅ WhatsApp connected!');
-        pairingCache.clear();
-      }
-
-      if (connection === 'close') {
-        isConnected = false;
-        // Stale codes/socket reference — clear both immediately so
-        // /get-code doesn't try to reuse a dead session while we reconnect.
-        pairingCache.clear();
-        const deadSock = sock;
-        sock = null;
-
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        console.log(`🔌 Disconnected, statusCode: ${statusCode}`);
-
-        if (statusCode === DisconnectReason.loggedOut) {
-          console.log('🚫 Logged out – clearing session');
-          fs.rmSync('./auth_info', { recursive: true, force: true });
-          setTimeout(() => connectToWhatsApp(), 5000);
-        } else if (statusCode === DisconnectReason.restartRequired || statusCode === 408 || statusCode === 515) {
-          console.log('🔄 Restart required, reconnecting...');
-          setTimeout(() => connectToWhatsApp(), 3000);
-        } else {
-          const delayMs = Math.min(60000, 2000 * Math.pow(2, (deadSock?.reconnectAttempts || 0)));
-          console.log(`🔄 Reconnecting in ${delayMs / 1000}s`);
-          setTimeout(() => connectToWhatsApp(), delayMs);
-        }
-      }
-     } catch (err) {
-       console.error('❌ Error in connection.update handler (kept alive):', err.message);
-     }
-    });
-
-    sock.ev.on('creds.update', async () => {
-      try {
-        await saveCreds();
-      } catch (err) {
-        console.error('❌ Failed to save creds:', err.message);
-      }
-    });
-
-  } catch (err) {
-    console.error('❌ Connection error:', err.message);
-    setTimeout(() => connectToWhatsApp(), 5000);
-  }
-}
-
-// ---------- BULK SEND JOB RUNNER ----------
-async function runBulkJob(numbers, messageText, delaySeconds) {
-  bulkJob.running = true;
-  bulkJob.stopRequested = false;
-  bulkJob.total = numbers.length;
-  bulkJob.sent = 0;
-  bulkJob.failed = 0;
-  bulkJob.currentNumber = null;
-  bulkJob.log = [];
-  bulkJob.startedAt = Date.now();
-  bulkJob.finishedAt = null;
-
-  const baseDelayMs = Math.max(1, delaySeconds) * 1000;
-
-  for (const number of numbers) {
-    if (bulkJob.stopRequested) {
-      bulkLog({ number, status: 'skipped (stopped)' });
-      continue;
-    }
-
-    // If connection drops mid-run, pause the loop rather than blasting
-    // errors for every remaining number — wait for reconnect briefly.
-    let waited = 0;
-    while (!(isConnected && sock?.user) && waited < 30000 && !bulkJob.stopRequested) {
-      await delay(1000);
-      waited += 1000;
-    }
-    if (!(isConnected && sock?.user)) {
-      bulkLog({ number, status: 'failed', error: 'WhatsApp disconnected' });
-      bulkJob.failed++;
-      continue;
-    }
-
-    bulkJob.currentNumber = number;
-    const jid = number + '@s.whatsapp.net';
-
-    try {
-      let checkedJid = jid;
-      try {
-        const [result] = await sock.onWhatsApp(jid);
-        if (result && result.exists === false) {
-          bulkLog({ number, status: 'failed', error: 'Not on WhatsApp' });
-          bulkJob.failed++;
-          // still respect the delay so we don't hammer the lookup endpoint
-          await delay(baseDelayMs + Math.floor(Math.random() * 1000));
-          continue;
-        }
-        if (result?.jid) checkedJid = result.jid;
-      } catch {
-        // lookup failing shouldn't block the send attempt
-      }
-
-      await sock.sendMessage(checkedJid, { text: messageText });
-      bulkJob.sent++;
-      bulkLog({ number, status: 'sent' });
-    } catch (err) {
-      bulkJob.failed++;
-      bulkLog({ number, status: 'failed', error: err.message });
-    }
-
-    // Random jitter (±30%) around the requested delay so sends don't look
-    // like a bot firing at a perfectly fixed interval.
-    const jitter = baseDelayMs * (0.7 + Math.random() * 0.6);
-    await delay(jitter);
-  }
-
-  bulkJob.currentNumber = null;
-  bulkJob.running = false;
-  bulkJob.finishedAt = Date.now();
-}
-
-// ---------- BULK SEND PAGE ----------
-app.get('/bulk', (req, res) => {
-  res.send(`
-    <html>
-    <head>
-      <title>Bulk Send - Muskan with Yanki</title>
-      <style>
-        body { background:#111; color:#0f0; font-family:monospace; padding:30px; max-width:700px; margin:0 auto; }
-        h1 { color:#f0f; text-align:center; }
-        label { display:block; margin-top:15px; color:#aaa; }
-        input, textarea { width:100%; padding:10px; margin-top:5px; background:#222; border:1px solid #444; color:#fff; font-family:monospace; border-radius:5px; box-sizing:border-box; }
-        button { background:#f0f; color:#fff; padding:12px 30px; border:none; border-radius:5px; cursor:pointer; font-size:1.1em; margin-top:20px; }
-        .hint { color:#888; font-size:0.85em; }
-        a { color:#0f0; }
-      </style>
-    </head>
-    <body>
-      <h1>📨 Bulk Send</h1>
-      <form action="/bulk/start" method="post" enctype="multipart/form-data">
-        <label>Target numbers file (.txt/.csv — one number per line, with country code)</label>
-        <input type="file" name="targetFile" accept=".txt,.csv" required>
-        <p class="hint">Or paste numbers directly below (used only if no file is chosen):</p>
-        <textarea name="targetNumbers" rows="3" placeholder="919999999999&#10;919888888888"></textarea>
-
-        <label>Message text</label>
-        <textarea name="message" rows="4" placeholder="Type your message..."></textarea>
-        <p class="hint">Or upload a message file (.txt) — used instead if provided:</p>
-        <input type="file" name="messageFile" accept=".txt">
-
-        <label>Delay between messages (seconds)</label>
-        <input type="number" name="delaySeconds" min="1" value="5" required>
-        <p class="hint">Higher delay = safer for your number. Don't go below a few seconds.</p>
-
-        <button type="submit">▶ START</button>
-      </form>
-      <p style="margin-top:20px;"><a href="/bulk/status">📊 View progress</a> | <a href="/">🏠 Dashboard</a></p>
-    </body>
-    </html>
-  `);
 });
 
-app.post('/bulk/start', upload.fields([{ name: 'targetFile', maxCount: 1 }, { name: 'messageFile', maxCount: 1 }]), async (req, res) => {
-  if (bulkJob.running) {
-    return res.send('<h2>❌ A bulk job is already running.</h2><a href="/bulk/status">VIEW PROGRESS</a>');
-  }
-  if (!isConnected || !sock?.user) {
-    return res.send('<h2>❌ WhatsApp not connected. Please pair first.</h2><a href="/">BACK</a>');
-  }
-
-  const targetFile = req.files?.targetFile?.[0];
-  const messageFile = req.files?.messageFile?.[0];
-
-  const numbersSource = targetFile ? targetFile.buffer.toString('utf-8') : (req.body.targetNumbers || '');
-  const numbers = parseNumbersFromText(numbersSource);
-
-  const messageText = messageFile ? messageFile.buffer.toString('utf-8').trim() : (req.body.message || '').trim();
-
-  const delaySeconds = Math.max(1, parseInt(req.body.delaySeconds, 10) || 5);
-
-  if (numbers.length === 0) {
-    return res.send('<h2>❌ No valid numbers found in file/input.</h2><a href="/bulk">BACK</a>');
-  }
-  if (!messageText) {
-    return res.send('<h2>❌ Message is empty — provide text or a message file.</h2><a href="/bulk">BACK</a>');
-  }
-
-  // Fire and forget — the job runs in the background, progress via /bulk/status
-  runBulkJob(numbers, messageText, delaySeconds).catch(err => {
-    console.error('❌ Bulk job crashed (kept server alive):', err.message);
-    bulkJob.running = false;
-    bulkJob.finishedAt = Date.now();
-  });
-
-  res.redirect('/bulk/status');
+app.get('/api/logs', (req, res) => {
+    res.json({ logs: liveLogs, connected: !!MznKing?.user, active: loopController.active });
 });
 
-app.post('/bulk/stop', (req, res) => {
-  bulkJob.stopRequested = true;
-  res.redirect('/bulk/status');
-});
-
-app.get('/bulk/status', (req, res) => {
-  const logRows = bulkJob.log.slice(-50).reverse().map(l =>
-    `<tr><td>${l.number}</td><td style="color:${l.status === 'sent' ? '#0f0' : '#f66'}">${l.status}</td><td>${l.error || ''}</td></tr>`
-  ).join('');
-
-  res.send(`
-    <html>
-    <head>
-      <title>Bulk Progress</title>
-      ${bulkJob.running ? '<meta http-equiv="refresh" content="3">' : ''}
-      <style>
-        body { background:#111; color:#0f0; font-family:monospace; padding:30px; max-width:800px; margin:0 auto; }
-        h1 { color:#f0f; text-align:center; }
-        .stats { display:flex; justify-content:space-around; background:#222; padding:15px; border-radius:8px; margin:20px 0; }
-        table { width:100%; border-collapse:collapse; font-size:0.85em; }
-        td, th { padding:6px; border-bottom:1px solid #333; text-align:left; }
-        button { background:#f66; color:#fff; padding:10px 20px; border:none; border-radius:5px; cursor:pointer; }
-        a { color:#0f0; }
-      </style>
-    </head>
-    <body>
-      <h1>📊 Bulk Send Progress</h1>
-      <div class="stats">
-        <div>Status: <b style="color:${bulkJob.running ? '#0f0' : '#aaa'}">${bulkJob.running ? 'RUNNING' : 'IDLE'}</b></div>
-        <div>Total: <b>${bulkJob.total}</b></div>
-        <div>Sent: <b style="color:#0f0">${bulkJob.sent}</b></div>
-        <div>Failed: <b style="color:#f66">${bulkJob.failed}</b></div>
-      </div>
-      ${bulkJob.currentNumber ? `<p>Currently sending to: <b>${bulkJob.currentNumber}</b></p>` : ''}
-      ${bulkJob.running ? '<form action="/bulk/stop" method="post"><button type="submit">⏹ STOP</button></form>' : ''}
-      <table>
-        <tr><th>Number</th><th>Status</th><th>Error</th></tr>
-        ${logRows || '<tr><td colspan="3">No activity yet</td></tr>'}
-      </table>
-      <p style="margin-top:20px;"><a href="/bulk">🔁 New Job</a> | <a href="/">🏠 Dashboard</a></p>
-    </body>
-    </html>
-  `);
-});
-
-// ---------- GROUP UID LIST ----------
-app.get('/groups', async (req, res) => {
-  if (!isConnected || !sock?.user) {
-    return res.send('<h2>❌ WhatsApp not connected. Please pair first.</h2><a href="/">BACK</a>');
-  }
-  try {
-    const groups = await sock.groupFetchAllParticipating();
-    const rows = Object.values(groups).map(g =>
-      `<tr><td>${g.subject || '(no name)'}</td><td style="font-size:0.8em;">${g.id}</td><td>${g.participants?.length ?? '-'}</td></tr>`
-    ).join('');
-
-    res.send(`
-      <html>
-      <head>
-        <title>Groups</title>
-        <style>
-          body { background:#111; color:#0f0; font-family:monospace; padding:30px; max-width:800px; margin:0 auto; }
-          h1 { color:#f0f; text-align:center; }
-          table { width:100%; border-collapse:collapse; font-size:0.85em; }
-          td, th { padding:8px; border-bottom:1px solid #333; text-align:left; }
-          a { color:#0f0; }
-        </style>
-      </head>
-      <body>
-        <h1>👥 Your Groups</h1>
-        <table>
-          <tr><th>Name</th><th>Group UID</th><th>Members</th></tr>
-          ${rows || '<tr><td colspan="3">No groups found</td></tr>'}
-        </table>
-        <p style="margin-top:20px;"><a href="/">🏠 Dashboard</a></p>
-      </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error('❌ Group fetch error:', err.message);
-    res.send(`<h2>❌ Failed to fetch groups: ${err.message}</h2><a href="/">BACK</a>`);
-  }
-});
-
-// ---------- DEBUG STATUS ----------
-app.get('/status', (req, res) => {
-  res.json({
-    socketExists: !!sock,
-    isConnected,
-    hasUser: !!sock?.user,
-    wsReadyState: sock?.ws?.readyState ?? null,
-    sockGeneration,
-    bulkJobRunning: bulkJob.running,
-    uptimeSeconds: Math.floor(process.uptime()),
-  });
-});
-
-// ---------- PAIRING PAGE ----------
-app.get('/pair', (req, res) => {
-  res.send(`
-    <html>
-    <head>
-      <title>Pair WhatsApp - Muskan with Yanki</title>
-      <style>
-        body { background:#111; color:#0f0; font-family:monospace; text-align:center; padding:40px; }
-        h1 { color:#f0f; }
-        input { padding:15px; font-size:1.2em; background:#222; border:2px solid #f0f; color:#fff; border-radius:5px; width:300px; margin:20px; }
-        button { padding:15px 30px; background:#f0f; color:#fff; border:none; border-radius:5px; font-size:1.2em; cursor:pointer; }
-        .steps { background:#222; padding:15px; border-radius:5px; margin:20px auto; max-width:500px; text-align:left; color:#aaa; }
-        a { color:#0f0; }
-      </style>
-    </head>
-    <body>
-      <h1>📱 Pair WhatsApp</h1>
-      <p>Enter your phone number with country code (no + or spaces)</p>
-      <form action="/get-code" method="post">
-        <input type="text" name="phone" placeholder="919999999999" required>
-        <br>
-        <button type="submit">GET PAIRING CODE</button>
-      </form>
-      <div class="steps">
-        <strong>📌 How to link:</strong><br>
-        1. Open WhatsApp on your phone<br>
-        2. Go to Settings → Linked Devices<br>
-        3. Tap "Link a Device"<br>
-        4. Choose "Link with phone number instead?"<br>
-        5. Enter the code shown here (within 2 minutes)
-      </div>
-      <p><a href="/">🏠 Dashboard</a></p>
-    </body>
-    </html>
-  `);
-});
-
-// ---------- GET PAIRING CODE ----------
-app.post('/get-code', async (req, res) => {
-  const phoneRaw = req.body.phone || '';
-  const phone = normalizePhone(phoneRaw);
-  if (!phone) {
-    return res.send('<h2>❌ Invalid phone number</h2><a href="/pair">BACK</a>');
-  }
-
-  // Ensure socket exists — poll briefly instead of failing instantly,
-  // since right after a cold start the socket can take a few seconds to spin up.
-  let waited = 0;
-  while (!sock && waited < 15000) {
-    await delay(500);
-    waited += 500;
-  }
-  if (!sock) {
-    return res.send('<h2>❌ WhatsApp not ready yet. Please wait a few seconds and try again.</h2><a href="/pair">BACK</a>');
-  }
-
-  // If already authenticated, no pairing needed
-  if (isConnected && sock.user) {
-    return res.send('<h2>✅ Already paired!</h2><a href="/">GO TO DASHBOARD</a>');
-  }
-
-  // Check for existing valid code (prevents duplicate generation) — but only
-  // if it came from the socket session that's still alive.
-  const existing = pairingCache.get(phone);
-  if (existing && existing.generation === sockGeneration && (Date.now() - existing.timestamp < PAIRING_CACHE_MS)) {
-    const formatted = existing.code.match(/.{1,4}/g)?.join('-') || existing.code;
-    return res.send(`
-      <html>
-      <head><title>Pairing Code</title>
-      <style>
-        body { background:#111; color:#0f0; font-family:monospace; text-align:center; padding:40px; }
-        .code-box { font-size:3em; color:#f0f; letter-spacing:5px; background:#000; padding:20px; border-radius:10px; display:inline-block; margin:20px; }
-        a { color:#0f0; }
-      </style>
-      </head>
-      <body>
-        <h1>📱 Pairing Code</h1>
-        <div class="code-box">${formatted}</div>
-        <p style="color:#aaa;">(Re‑using same code – still valid)</p>
-        <p><a href="/">🏠 Dashboard</a> | <a href="/pair">🔄 New Code</a></p>
-      </body>
-      </html>
-    `);
-  }
-
-  const currentSock = sock;
-  const currentGeneration = sockGeneration;
-
-  try {
-    const ready = await waitForSocketReady(currentSock);
-    if (!ready || currentSock !== sock) {
-      return res.send('<h2>❌ WhatsApp connection isn\'t ready yet. Please wait a few seconds and try again.</h2><a href="/pair">BACK</a>');
-    }
-
-    // Retry a couple of times — transient "Connection Closed" errors can
-    // happen right as the WS finishes its handshake.
-    let rawCode = null;
-    let lastErr = null;
-    for (let attempt = 0; attempt < 3 && !rawCode; attempt++) {
-      try {
-        rawCode = await currentSock.requestPairingCode(phone);
-      } catch (err) {
-        lastErr = err;
-        if (attempt < 2) await delay(1000);
-      }
-    }
-
-    if (!rawCode) throw lastErr || new Error('Unknown pairing error');
-
-    const formatted = rawCode.match(/.{1,4}/g)?.join('-') || rawCode;
-    pairingCache.set(phone, { code: rawCode, timestamp: Date.now(), generation: currentGeneration });
-
-    res.send(`
-      <html>
-      <head>
-        <title>Pairing Code</title>
-        <style>
-          body { background:#111; color:#0f0; font-family:monospace; text-align:center; padding:40px; }
-          .code-box { font-size:3em; color:#f0f; letter-spacing:5px; background:#000; padding:20px; border-radius:10px; display:inline-block; margin:20px; }
-          a { color:#0f0; }
-        </style>
-      </head>
-      <body>
-        <h1>📱 Pairing Code</h1>
-        <div class="code-box">${formatted}</div>
-        <p style="color:#aaa;">Enter this code in WhatsApp → Linked Devices → Link a Device (within ~1 minute)</p>
-        <p><a href="/">🏠 Dashboard</a> | <a href="/pair">🔄 New Code</a></p>
-      </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error('❌ Pairing error:', err.message);
-    res.send(`<h2>❌ Pairing failed: ${err.message}</h2><p>Try tapping "New Code" — if it keeps failing, the connection may need a moment to settle.</p><a href="/pair">BACK</a>`);
-  }
-});
-
-// ---------- DASHBOARD ----------
+// Simple dashboard
 app.get('/', (req, res) => {
-  res.send(`
-    <html>
-    <head>
-      <title>Muskan with Yanki</title>
-      <style>
-        body { background:#0a0a0f; color:#0f0; font-family:monospace; padding:20px; }
-        h1 { color:#f0f; text-align:center; }
-        .box { background:#111; padding:20px; border-radius:10px; max-width:800px; margin:20px auto; border:1px solid #333; }
-        input, textarea { width:100%; padding:10px; margin:10px 0; background:#222; border:1px solid #444; color:#fff; font-family:monospace; border-radius:5px; }
-        button { background:#f0f; color:#fff; padding:12px 30px; border:none; border-radius:5px; cursor:pointer; font-size:1.1em; }
-        .status { text-align:center; font-size:1.5em; margin:20px 0; }
-        a { color:#0f0; }
-      </style>
-    </head>
-    <body>
-      <h1>🔥 Muskan with Yanki</h1>
-      <div class="status">
-        Status: <span style="color:${isConnected ? '#0f0' : '#f00'};">${isConnected ? 'CONNECTED' : 'DISCONNECTED'}</span>
-      </div>
-      <div class="box">
-        <h3>📱 Pair WhatsApp</h3>
-        <a href="/pair">Go to Pairing Page</a>
-      </div>
-      <div class="box">
-        <h3>📨 Bulk Send</h3>
-        <a href="/bulk">Go to Bulk Send</a>
-      </div>
-      <div class="box">
-        <h3>👥 Groups</h3>
-        <a href="/groups">View Group UIDs</a>
-      </div>
-      <div class="box">
-        <h3>📤 Send Message</h3>
-        <form action="/send-test" method="post">
-          <label>Recipient Phone Number (with country code, no +)</label>
-          <input type="text" name="number" placeholder="919999999999" required>
-          <label>Message (optional — leave blank for a default test message)</label>
-          <textarea name="message" rows="3" placeholder="Type your message..."></textarea>
-          <button type="submit">Send Message</button>
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+    <title>MUAKAN WITH YANKI - INFINITE</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a0f; color: #00ff88; font-family: monospace; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header { text-align: center; padding: 20px; border-bottom: 2px solid #ff00ff; margin-bottom: 20px; }
+        .header h1 { color: #ff00ff; font-size: 2em; }
+        .status-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; margin-bottom: 20px; }
+        .card { background: #111; border: 1px solid #333; padding: 15px; text-align: center; border-radius: 5px; }
+        .card-value { font-size: 2em; font-weight: bold; }
+        .card-label { font-size: 0.7em; color: #888; margin-top: 5px; }
+        .green { color: #00ff88; }
+        .red { color: #ff4444; }
+        .neon { color: #ff00ff; }
+        .nav { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+        .nav a, .nav button { background: linear-gradient(135deg,#ff00ff,#8800ee); color: white; padding: 10px 20px; text-decoration: none; border: none; cursor: pointer; font-family: monospace; border-radius: 5px; }
+        .stop-btn { background: linear-gradient(135deg,#ff4444,#880000); }
+        form { background: #111; padding: 20px; border-radius: 5px; margin-top: 20px; }
+        input, textarea, select { width: 100%; padding: 10px; margin: 10px 0; background: #222; border: 1px solid #444; color: white; font-family: monospace; }
+        button { background: #00ff88; color: black; padding: 10px 20px; border: none; cursor: pointer; font-weight: bold; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🔥 MUSKAN WITH YANKI INFINITE 🔥</h1>
+        <p>WILL NEVER STOP • AUTO-HEALING • SMART THROTTLING</p>
+    </div>
+    
+    <div class="nav">
+        <a href="/">DASHBOARD</a>
+        <a href="/pair">PAIR</a>
+        <a href="/attack-page">ATTACK</a>
+        <a href="/logs-page">LOGS</a>
+        <form action="/stop" method="post" style="margin:0;padding:0;display:inline">
+            <button type="submit" class="stop-btn" style="background:#ff4444;color:white">⛔ STOP</button>
         </form>
-      </div>
-    </body>
-    </html>
-  `);
+    </div>
+    
+    <div class="status-grid">
+        <div class="card"><div class="card-value green" id="conn">OFFLINE</div><div class="card-label">CONNECTION</div></div>
+        <div class="card"><div class="card-value neon" id="loop">IDLE</div><div class="card-label">LOOP</div></div>
+        <div class="card"><div class="card-value green" id="sent">0</div><div class="card-label">SENT</div></div>
+        <div class="card"><div class="card-value red" id="failed">0</div><div class="card-label">FAILED</div></div>
+    </div>
+    
+    <form action="/attack" method="post" enctype="multipart/form-data">
+        <h3>⚡ START INFINITE ATTACK</h3>
+        <textarea name="numbers" placeholder="Phone numbers (one per line)&#10;919999999999&#10;918888888888" rows="3"></textarea>
+        <textarea name="groups" placeholder="Group IDs (one per line)&#10;123456789@g.us" rows="2"></textarea>
+        <input type="file" name="msgFile" accept=".txt" required>
+        <input type="text" name="hater" placeholder="Your Name" required>
+        <input type="number" name="delay" value="15" min="5" step="1">
+        <button type="submit">🔥 START INFINITE ATTACK 🔥</button>
+    </form>
+</div>
+<script>
+function refresh(){
+    fetch('/api/status').then(r=>r.json()).then(d=>{
+        document.getElementById('conn').textContent = d.connected ? 'ONLINE' : 'OFFLINE';
+        document.getElementById('loop').textContent = d.running ? 'RUNNING' : (d.active ? 'ACTIVE' : 'IDLE');
+        document.getElementById('sent').textContent = d.totalSent || 0;
+        document.getElementById('failed').textContent = d.totalFailed || 0;
+    }).catch(e=>{});
+}
+setInterval(refresh, 2000);
+refresh();
+</script>
+</body>
+</html>`);
 });
 
-// ---------- SEND TEST MESSAGE ----------
-app.post('/send-test', async (req, res) => {
-  const phoneRaw = req.body.number || '';
-  const phone = normalizePhone(phoneRaw);
-  const messageText = (req.body.message || '').trim() || '✅ Test message from Muskan with Yanki — connection OK!';
+app.get('/pair', (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Pair WhatsApp</title><style>body{background:#0a0a0f;color:#00ff88;font-family:monospace;padding:20px;text-align:center}</style></head><body><h1>🔗 PAIR WHATSAPP</h1><form action="/pair" method="post"><input type="text" name="phone" placeholder="919999999999" required><button type="submit">GET CODE</button></form><a href="/">← BACK</a></body></html>`);
+});
 
-  if (!phone) {
-    return res.send('<h2>❌ Invalid phone number</h2><a href="/">BACK</a>');
-  }
-  if (!isConnected || !sock?.user) {
-    return res.send('<h2>❌ WhatsApp not connected. Please pair first.</h2><a href="/">BACK</a>');
-  }
-
-  // Capture the socket reference now — if it gets replaced mid-request
-  // (reconnect happening in parallel), we don't want to send on a dead one.
-  const currentSock = sock;
-  const jid = phone + '@s.whatsapp.net';
-
-  try {
-    // Confirm the number is actually on WhatsApp before sending — sending
-    // to a non-WA number silently fails or errors confusingly otherwise.
-    let checkedJid = jid;
+app.post('/pair', async (req, res) => {
     try {
-      const [result] = await currentSock.onWhatsApp(jid);
-      if (result && result.exists === false) {
-        return res.send('<h2>❌ This number isn\'t on WhatsApp.</h2><a href="/">BACK</a>');
-      }
-      if (result?.jid) checkedJid = result.jid;
-    } catch (checkErr) {
-      // onWhatsApp lookup failing shouldn't block sending — some servers
-      // restrict this; just fall through and try the direct send.
-      console.error('⚠️ onWhatsApp lookup failed, sending anyway:', checkErr.message);
-    }
-
-    if (currentSock !== sock || !isConnected) {
-      return res.send('<h2>❌ Connection changed while sending — please try again.</h2><a href="/">BACK</a>');
-    }
-
-    let sent = false;
-    let lastErr = null;
-    for (let attempt = 0; attempt < 3 && !sent; attempt++) {
-      try {
-        await currentSock.sendMessage(checkedJid, { text: messageText });
-        sent = true;
-      } catch (err) {
-        lastErr = err;
-        if (attempt < 2) await delay(1000);
-      }
-    }
-
-    if (!sent) throw lastErr || new Error('Unknown send error');
-
-    res.send('<h2>✅ Message sent successfully!</h2><a href="/">BACK TO DASHBOARD</a>');
-  } catch (err) {
-    console.error('❌ Send message error:', err.message);
-    res.send(`<h2>❌ Failed to send message: ${err.message}</h2><a href="/">BACK</a>`);
-  }
+        const phone = formatNumber(req.body.phone);
+        if (!MznKing) return res.send('<h2>❌ Service starting...</h2><a href="/">BACK</a>');
+        if (MznKing.user) return res.send('<h2>✅ Already connected!</h2><a href="/">BACK</a>');
+        const code = await MznKing.requestPairingCode(phone);
+        const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
+        res.send(`<h1>📱 PAIRING CODE</h1><h2 style="font-size:3em;color:#ff00ff">${formatted}</h2><p>Open WhatsApp → Settings → Linked Devices → Link with Phone Number</p><a href="/">BACK</a>`);
+    } catch(e) { res.send(`<h2>Error: ${e.message}</h2><a href="/">BACK</a>`); }
 });
 
-// ---------- START SERVER ----------
-const PORT = 5000;
-connectToWhatsApp();
-app.listen(PORT, () => {
-  console.log(`\n🚀 Muskan with Yanki running on http://localhost:${PORT}`);
-  console.log('📱 Pairing page: http://localhost:' + PORT + '/pair');
-  console.log('📤 Test message: http://localhost:' + PORT + '/send-test (POST)');
-  console.log('💡 QR is disabled. Use pairing code only.\n');
+app.get('/attack-page', (req, res) => {
+    res.redirect('/');
+});
+
+app.post('/attack', upload.single('msgFile'), async (req, res) => {
+    try {
+        if (!MznKing?.user) throw new Error('WhatsApp not connected!');
+        const { numbers, groups, hater, delay: delayTime } = req.body;
+        if (!req.file) throw new Error('No message file');
+        
+        messages = req.file.buffer.toString('utf-8').split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        haterName = hater || 'HARSH KING';
+        intervalTime = Math.max(5, parseInt(delayTime) || 15);
+        targets = [];
+        
+        if (numbers?.trim()) {
+            numbers.split('\n').forEach(n => {
+                const c = n.trim().replace(/\s/g,'');
+                if (c) targets.push(c.includes('@') ? c : c + '@s.whatsapp.net');
+            });
+        }
+        if (groups?.trim()) {
+            groups.split('\n').forEach(g => {
+                const c = g.trim().replace(/\s/g,'');
+                if (c) targets.push(c.includes('@') ? c : c + '@g.us');
+            });
+        }
+        
+        if (!targets.length) throw new Error('No targets!');
+        
+        stopLoop();
+        await delay(1000).catch(() => {});
+        
+        totalSent = totalFailed = totalErrors = 0;
+        loopController.crashCount = 0;
+        loopController.messageCount = 0;
+        loopController.forcedClearCount = 0;
+        sessionStart = Date.now();
+        errorBlacklist.clear();
+        blacklistCreatedAt.clear();
+        blacklistTimeouts.forEach(t => clearTimeout(t));
+        blacklistTimeouts.clear();
+        retryQueue.length = 0;
+        consecutiveErrors = 0;
+        isTempBlocked = false;
+        
+        addLog(`🚀 ATTACK STARTED | ${targets.length} targets | ${messages.length} messages | ${intervalTime}s delay`, 'success');
+        loopController.active = true;
+        startNonStopLoop();
+        res.redirect('/');
+    } catch(e) {
+        res.send(`<h2>❌ Error: ${e.message}</h2><a href="/">BACK</a>`);
+    }
+});
+
+app.post('/stop', (req, res) => {
+    stopLoop();
+    res.redirect('/');
+});
+
+app.get('/logs-page', (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Live Logs</title><style>body{background:#0a0a0f;color:#00ff88;font-family:monospace;padding:20px}pre{background:#000;padding:10px;overflow:auto;height:80vh}</style><meta http-equiv="refresh" content="5"></head><body><h1>📋 LIVE LOGS</h1><a href="/">← BACK</a><pre id="logs">Loading...</pre><script>setInterval(()=>{fetch('/api/logs').then(r=>r.json()).then(d=>{document.getElementById('logs').innerHTML=d.logs.map(l=>'['+l.timestamp+'] '+l.message).join('\\n')})},2000);</script></body></html>`);
+});
+
+// ════════════════════════════════════════════════════════════
+//  🔥 CRITICAL: Process-level error handlers (NON-STOP FIX)
+// ════════════════════════════════════════════════════════════
+process.on('uncaughtException', (err) => {
+    addLog(`💀 UNCAUGHT EXCEPTION: ${err.message}`, 'error');
+    addLog('🔄 Restarting process in 5 seconds...', 'warning');
+    // Give time to flush logs, then exit so PM2/forever can restart
+    setTimeout(() => process.exit(1), 5000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    addLog(`💀 UNHANDLED REJECTION: ${reason?.message || reason}`, 'error');
+    // Do NOT exit – just log and continue (critical to prevent crash)
+});
+
+// ════════════════════════════════════════════════════════════
+//  START SERVER
+// ════════════════════════════════════════════════════════════
+app.listen(port, () => {
+    console.log(`
+╔══════════════════════════════════════════════════════════╗
+║  🔥 MUSKAN WITH YANKI v7.0 - INFINITE 🔥                 ║
+║  ═══════════════════════════════════════════════════════║
+║  ✅ SMART RATE LIMIT DETECTION                          ║
+║  ✅ AUTO THROTTLING & COOLDOWN                          ║
+║  ✅ WILL NEVER STOP ONCE STARTED                        ║
+║  ✅ AUTO-RECOVERY FROM ANY ERROR                        ║
+╚══════════════════════════════════════════════════════════╝`);
 });

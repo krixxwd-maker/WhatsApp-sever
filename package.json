@@ -1,18 +1,19 @@
 {
-  "name": "muskan-with-yanki",
-  "version": "1.0.0",
-  "description": "WhatsApp pairing-code login, message send, and bulk send server using Baileys",
-  "main": "server.js",
+  "name": "muskan-with-yanki-infinite",
+  "version": "7.0.0",
+  "description": "WhatsApp infinite loop message sender with auto recovery",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "pino": "^9.4.0"
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
-    "express": "^4.19.2",
-    "multer": "^1.4.5-lts.1",
-    "pino": "^9.3.2"
-  }
+  "license": "MIT"
 }
